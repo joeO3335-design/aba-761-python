@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}PORTL — Home{% endblock %}
+{% block content %}
+<div class="hero">
+  <h1>PORTL</h1>
+  <p class="hero-sub">Portable Operant Research and Teaching Lab</p>
+  <p class="hero-desc">
+    A digital companion to the PORTL tabletop game by Jesús Rosales-Ruiz and Mary Hunter.
+    Practice teaching skills, collect research data, and analyze behavioral outcomes.
+  </p>
+  <div class="hero-cards">
+    <a href="{{ url_for('simulation') }}" class="card card-link">
+      <div class="card-icon">🎮</div>
+      <h2>Simulation</h2>
+      <p>Practice teacher/learner interactions. Deliver clicks, shape behaviors, manage sessions with 10-reinforcer intervals.</p>
+      <span class="btn btn-primary">Start Simulation</span>
+    </a>
+    <a href="{{ url_for('research') }}" class="card card-link">
+      <div class="card-icon">📊</div>
+      <h2>Research Data Tool</h2>
+      <p>Design studies, record session data across conditions, graph behavior across sessions, and export results.</p>
+      <span class="btn btn-secondary">Open Research Tool</span>
+    </a>
+  </div>
+</div>
+
+<section class="info-section">
+  <h3>How PORTL Works</h3>
+  <div class="info-grid">
+    <div class="info-item">
+      <strong>Conditioned Reinforcer</strong>
+      <p>A click signals to the learner that their behavior was correct and a primary reinforcer is coming.</p>
+    </div>
+    <div class="info-item">
+      <strong>Unconditioned Reinforcer</strong>
+      <p>Reinforcer blocks (tokens) delivered after the click serve as the primary reinforcer.</p>
+    </div>
+    <div class="info-item">
+      <strong>Session Structure</strong>
+      <p>Each session is divided into intervals of 10 reinforcers. Teachers record data and revise plans between intervals.</p>
+    </div>
+    <div class="info-item">
+      <strong>Shaping</strong>
+      <p>Successive approximations toward the target behavior are reinforced, with criteria raised as the learner succeeds.</p>
+    </div>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,28 @@
+# Database
+portl_app/portl.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Claude internal
+.claude/
+
+# Large binary files
+*.pdf
+*.PDF
+*.zip
+*.mp4
+*.docx
+*.parquet
+*.xlsx
+*.png
+*.jpg

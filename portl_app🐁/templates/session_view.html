@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}PORTL — Session {{ session['session_number'] }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('view_project', project_id=project['id']) }}" class="breadcrumb">&larr; {{ project['title'] }}</a>
+    <h1>Session {{ session['session_number'] }}</h1>
+    <p class="project-meta">
+      {{ session['date'] }} &nbsp;|&nbsp;
+      <span class="condition-badge">{{ session['condition'] }}</span>
+    </p>
+  </div>
+</div>
+
+<div class="detail-grid two-col">
+  {% if session['procedure_notes'] %}
+  <div class="card detail-card">
+    <label>Procedure Notes</label>
+    <p>{{ session['procedure_notes'] }}</p>
+  </div>
+  {% endif %}
+  {% if session['teacher_notes'] %}
+  <div class="card detail-card">
+    <label>Teacher Notes</label>
+    <p>{{ session['teacher_notes'] }}</p>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Interval Data</h2>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Interval</th>
+        <th>Behavior Count</th>
+        <th>Reinforcers Delivered</th>
+        <th>Errors</th>
+        <th>Plan / Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% set total_behavior = namespace(val=0) %}
+      {% set total_errors = namespace(val=0) %}
+      {% for iv in intervals %}
+      {% set total_behavior.val = total_behavior.val + iv['behavior_count'] %}
+      {% set total_errors.val = total_errors.val + iv['errors'] %}
+      <tr>
+        <td>{{ iv['interval_number'] }}</td>
+        <td>{{ iv['behavior_count'] }}</td>
+        <td>{{ iv['reinforcers_delivered'] }}</td>
+        <td>{{ iv['errors'] }}</td>
+        <td>{{ iv['plan_notes'] or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr class="totals-row">
+        <td><strong>Totals</strong></td>
+        <td><strong>{{ total_behavior.val }}</strong></td>
+        <td>—</td>
+        <td><strong>{{ total_errors.val }}</strong></td>
+        <td></td>
+      </tr>
+    </tfoot>
+  </table>
+</div>
+
+<!-- Mini chart for this session -->
+{% if intervals|length > 1 %}
+<div class="card">
+  <h2>Behavior Count by Interval</h2>
+  <div class="chart-container chart-sm">
+    <canvas id="intervalChart"></canvas>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if intervals|length > 1 %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+  const labels = [{% for iv in intervals %}"Interval {{ iv['interval_number'] }}"{% if not loop.last %}, {% endif %}{% endfor %}];
+  const counts = [{% for iv in intervals %}{{ iv['behavior_count'] }}{% if not loop.last %}, {% endif %}{% endfor %}];
+  const ctx = document.getElementById('intervalChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Behavior Count',
+        data: counts,
+        backgroundColor: 'rgba(79,142,247,0.7)',
+        borderColor: '#4f8ef7',
+        borderWidth: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      scales: {
+        y: { beginAtZero: true, title: { display: true, text: 'Count' } }
+      }
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}

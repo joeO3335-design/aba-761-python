@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}PORTL — New Project{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>New Research Project</h1>
+  <p>Define your study parameters before collecting data (Exercise 47).</p>
+</div>
+
+<div class="card">
+  <form method="POST">
+    <div class="form-section">
+      <h3>Project Identity</h3>
+      <div class="form-grid">
+        <div class="form-group full-width">
+          <label>Project Title *</label>
+          <input type="text" name="title" class="form-input" required
+                 placeholder="e.g., Effect of FR vs VR on button touching">
+        </div>
+        <div class="form-group">
+          <label>Participant ID *</label>
+          <input type="text" name="participant_id" class="form-input" required
+                 placeholder="e.g., P01">
+        </div>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <h3>Research Question</h3>
+      <div class="form-group full-width">
+        <label>Research Question</label>
+        <textarea name="research_question" class="form-input notes-input"
+                  placeholder="e.g., Does a variable ratio schedule produce higher rates of behavior than a fixed ratio schedule?"></textarea>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <h3>Behavior Definition</h3>
+      <div class="form-group full-width">
+        <label>Target Behavior (operational definition)</label>
+        <textarea name="behavior_definition" class="form-input notes-input"
+                  placeholder="Define the target behavior in clear, observable terms. e.g., 'Touching the blue circular button with any part of the finger so that the button moves.'"></textarea>
+      </div>
+      <div class="form-group full-width">
+        <label>Measurement Method</label>
+        <select name="measurement_method" class="form-input">
+          <option value="frequency">Frequency (count per interval)</option>
+          <option value="rate">Rate (responses per minute)</option>
+          <option value="duration">Duration</option>
+          <option value="latency">Latency</option>
+          <option value="irt">Inter-Response Time (IRT)</option>
+          <option value="percent_correct">Percent Correct</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Create Project</button>
+      <a href="{{ url_for('research') }}" class="btn btn-secondary">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

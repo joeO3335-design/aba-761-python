@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}PORTL — {{ project['title'] }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="{{ url_for('research') }}" class="breadcrumb">&larr; All Projects</a>
+    <h1>{{ project['title'] }}</h1>
+    <p class="project-meta">Participant: <strong>{{ project['participant_id'] }}</strong></p>
+  </div>
+  <div class="header-actions">
+    <a href="{{ url_for('new_session', project_id=project['id']) }}" class="btn btn-primary">+ Add Session</a>
+    <a href="{{ url_for('export_project', project_id=project['id']) }}" class="btn btn-secondary">Export CSV</a>
+  </div>
+</div>
+
+<!-- Project details -->
+<div class="card detail-card">
+  <div class="detail-grid">
+    {% if project['research_question'] %}
+    <div class="detail-item">
+      <label>Research Question</label>
+      <p>{{ project['research_question'] }}</p>
+    </div>
+    {% endif %}
+    {% if project['behavior_definition'] %}
+    <div class="detail-item">
+      <label>Behavior Definition</label>
+      <p>{{ project['behavior_definition'] }}</p>
+    </div>
+    {% endif %}
+    {% if project['measurement_method'] %}
+    <div class="detail-item">
+      <label>Measurement Method</label>
+      <p>{{ project['measurement_method'] | replace('_', ' ') | title }}</p>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Graph -->
+{% if sessions %}
+<div class="card">
+  <h2>Behavior Across Sessions</h2>
+  <div class="chart-container">
+    <canvas id="behaviorChart"></canvas>
+  </div>
+</div>
+
+<!-- Sessions table -->
+<div class="card">
+  <h2>Sessions</h2>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Session</th>
+        <th>Date</th>
+        <th>Condition</th>
+        <th>Procedure Notes</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td>{{ s['session_number'] }}</td>
+        <td>{{ s['date'] }}</td>
+        <td><span class="condition-badge condition-{{ s['condition'] | lower | replace(' ', '-') }}">{{ s['condition'] }}</span></td>
+        <td class="truncate">{{ s['procedure_notes'] or '—' }}</td>
+        <td><a href="{{ url_for('view_session', project_id=project['id'], session_id=s['id']) }}" class="btn btn-sm btn-secondary">View</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="empty-state">
+  <p>No sessions yet. Add your first session to begin collecting data.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+  const projectId = {{ project['id'] }};
+  fetch(`/api/research/project/${projectId}/chart_data`)
+    .then(r => r.json())
+    .then(data => {
+      if (!data.labels.length) return;
+
+      // Build color list by condition
+      const conditionColors = {};
+      const palette = ['#4f8ef7','#f5a623','#7ed321','#d0021b','#9b59b6','#1abc9c'];
+      let ci = 0;
+      data.conditions.forEach(c => {
+        if (!conditionColors[c]) conditionColors[c] = palette[ci++ % palette.length];
+      });
+
+      const ctx = document.getElementById('behaviorChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: data.labels,
+          datasets: [{
+            label: 'Total Behavior Count',
+            data: data.totals,
+            borderColor: '#4f8ef7',
+            backgroundColor: 'rgba(79,142,247,0.1)',
+            borderWidth: 2,
+            pointRadius: 5,
+            pointBackgroundColor: data.conditions.map(c => conditionColors[c]),
+            tension: 0.1
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: true },
+            tooltip: {
+              callbacks: {
+                afterBody: (items) => {
+                  const idx = items[0].dataIndex;
+                  return `Condition: ${data.conditions[idx]}`;
+                }
+              }
+            }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: 'Behavior Count' }
+            },
+            x: {
+              title: { display: true, text: 'Session' }
+            }
+          }
+        }
+      });
+    });
+</script>
+{% endblock %}

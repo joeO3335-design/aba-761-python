@@ -1,0 +1,90 @@
+{
+  "behaviors": [
+    "Off-Task",
+    "Fidgeting",
+    "Calling out/ Making sounds",
+    "Out of seat",
+    "Non-compliance",
+    "Arguing",
+    "Elopement",
+    "Mand/ request",
+    "Compliance/ on task",
+    "Self-injurious behavior",
+    "Aggression",
+    "Property destruction",
+    "Other",
+    "Genital Exposure: The student removes, lowers, or manipulates clothing (e.g., pulling down pants, lifting a skirt, or lowering underwear) such that the buttocks, genitals, or pubic area are visible to others, or places one or both hands inside the front or back of their pants in a manner that is observable to others.",
+    "Passive Work Refusal: The student does not begin an assigned task within [X] minutes of the instruction being given, or begins but stops working for [X] or more minutes without a teacher-approved reason, or submits or presents work with three or more items left blank or incomplete when the assignment contained sufficient time for completion."
+  ],
+  "antecedents": [
+    "No antecedent observed",
+    "Peer reactions or interactions (Att)(Esc)",
+    "Staff attention is diverted or removed (Att)",
+    "Absence or presence of a specific person (Att)",
+    "Loud, bright, chaotic, or crowded environment (Sel)",
+    "Transition to a different activity or location (Tan)",
+    "Prompt, redirection or to correction of student work (Esc)(Att)",
+    "Instruction, direction, or request to complete task (Esc)(Att)",
+    "Object/activity delayed, denied, interrupted or terminated (Tan)",
+    "Unstructured activity, free time (Att)(Sel)",
+    "Other"
+  ],
+  "consequences": [
+    "Staff intervention (reaction or interaction) (Att)",
+    "Staff attention is diverted or removed (Att)",
+    "Peer reactions or interactions (Att)",
+    "Preferred object or activity given (Tan)",
+    "Object/activity removed or terminated (Tan)",
+    "No environmental change (Sel)",
+    "Tasks delayed or removed (Esc)",
+    "Other"
+  ],
+  "locations": [
+    "Classroom",
+    "Library",
+    "Hallway",
+    "Playground",
+    "Bathroom",
+    "Gymnasium",
+    "Cafeteria",
+    "Other"
+  ],
+  "people_intervening": [
+    "Peer/another child",
+    "Teacher",
+    "Paraprofessional",
+    "Guidance Counselors",
+    "Security Officers",
+    "None",
+    "Other"
+  ],
+  "subjects": [
+    "Language Arts",
+    "Math",
+    "Physical Education",
+    "Science",
+    "Social Studies",
+    "Art",
+    "Music",
+    "N/A"
+  ],
+  "activities": [
+    "Academic Work",
+    "Leisure Activity (Alone)",
+    "Leisure Activity (with another person)",
+    "Meal (preparation, eating, clean up)",
+    "Self care or daily living tasks",
+    "Alone",
+    "Other"
+  ],
+  "instructional_formats": [
+    "Cooperative Learning (Peer partners)",
+    "Small group (2-12 students)",
+    "Large group (13 or more students)",
+    "Independent/ Seat work",
+    "1 to 1 (Student to staff ratio)",
+    "Dyad (2 students 1 staff)",
+    "Unstructured time",
+    "Other"
+  ]
+}

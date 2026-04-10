@@ -1,0 +1,31 @@
+import pandas as pd
+
+students = []
+
+while True:
+    name = input("Enter student name (or 'done' to quit): ") [4]
+    if name.lower() == 'done':
+    
+    try:
+        # Input the daily rate and convert it to a float
+        daily_rate = float(input(f"Enter the daily rate for {name}: ")) [5, 6]
+        
+        # Perform calculations
+        weekly = daily_rate * 7
+        monthly = weekly * 4.5
+        yearly = daily_rate * 180
+        
+        # Store in a list of dictionaries
+        students.append({
+            'Name': name,
+            'Daily Rate': daily_rate,
+            'Weekly Sum': weekly,
+            'Monthly Sum (4.5x)': monthly,
+            'Yearly Sum (180 days)': yearly
+        }) [7, 8]
+    except ValueError:
+        print("Invalid input. Please enter a numeric value for the rate.") [5]
+
+# Create the final DataFrame
+df = pd.DataFrame(students) [1, 9]
+print(df) [10]

@@ -1,0 +1,237 @@
+{% extends "base.html" %}
+{% block title %}PORTL — Simulation{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>PORTL Simulation</h1>
+  <p>Practice as the teacher or discover contingencies as the learner.</p>
+</div>
+
+<!-- XP / Level strip -->
+<div class="xp-strip">
+  <div class="xp-level-badge" id="xp-level-num">1</div>
+  <div class="xp-bar-area">
+    <div class="xp-bar-outer"><div class="xp-bar-inner" id="xp-bar-inner" style="width:0%"></div></div>
+    <div class="xp-bar-labels">
+      <span id="xp-bar-text">0 / 150 XP to level 2</span>
+      <span id="xp-total">0 XP</span>
+    </div>
+  </div>
+  <div class="xp-tier-label" id="xp-tier-label">Novice</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     PANEL 1 — Setup
+═══════════════════════════════════════════════════════════ -->
+<div id="setup-panel" class="card">
+  <h2>Session Setup</h2>
+
+  <div class="role-toggle-group">
+    <label class="role-option">
+      <input type="radio" name="role" value="teacher" checked onchange="onRoleChange()">
+      <div class="role-card">
+        <span class="role-icon">🎓</span>
+        <div>
+          <span class="role-title">Teacher</span>
+          <span class="role-desc">You arrange the board and deliver reinforcers</span>
+        </div>
+      </div>
+    </label>
+    <label class="role-option">
+      <input type="radio" name="role" value="learner" onchange="onRoleChange()">
+      <div class="role-card">
+        <span class="role-icon">🧠</span>
+        <div>
+          <span class="role-title">Learner <span class="xp-bonus-badge">1.5× XP</span></span>
+          <span class="role-desc">Objective hidden — discover it through contingencies</span>
+        </div>
+      </div>
+    </label>
+  </div>
+
+  <div class="form-group" style="margin-bottom:1.25rem">
+    <label>Exercise <small>(optional — auto-fills fields below)</small></label>
+    <select id="exercise-select" class="form-input" onchange="onExerciseChange()">
+      <option value="">— Select a PORTL Exercise —</option>
+    </select>
+  </div>
+  <div id="exercise-info" class="exercise-info hidden">
+    <strong>Goal:</strong> <span id="exercise-goal"></span>
+  </div>
+
+  <div class="form-grid">
+    <div class="form-group">
+      <label>Target Behavior / Goal</label>
+      <input type="text" id="target-behavior" placeholder="e.g., Touch the blue disc" class="form-input">
+    </div>
+    <div class="form-group">
+      <label>Procedure</label>
+      <select id="procedure" class="form-input">
+        <option value="shaping">Shaping</option>
+        <option value="differential_reinforcement">Differential Reinforcement</option>
+        <option value="errorless_learning">Errorless Learning</option>
+        <option value="stimulus_control">Stimulus Control</option>
+        <option value="behavior_chain">Behavior Chain</option>
+        <option value="schedule">Schedule of Reinforcement</option>
+      </select>
+    </div>
+    <div class="form-group hidden" id="target-object-group">
+      <label>Target Object <small>(reference — set precisely on the board)</small></label>
+      <select id="target-object-select" class="form-input"></select>
+    </div>
+    <div class="form-group hidden" id="schedule-type-group">
+      <label>Schedule Type</label>
+      <select id="schedule-type" class="form-input">
+        <option value="CRF">CRF — every response</option>
+        <option value="FR">FR-3 — every 3rd response</option>
+        <option value="VR" selected>VR-3 — average every 3rd</option>
+        <option value="FR5">FR-5 — every 5th response</option>
+        <option value="VR5">VR-5 — average every 5th</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Reinforcers per Interval</label>
+      <input type="number" id="interval-size" value="10" min="1" max="50" class="form-input">
+    </div>
+    <div class="form-group">
+      <label>Number of Intervals</label>
+      <input type="number" id="num-intervals" value="3" min="1" max="20" class="form-input">
+    </div>
+  </div>
+
+  <button class="btn btn-primary" onclick="goToBoard()">Set Up Board &rarr;</button>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     PANEL 2 — Board Builder
+═══════════════════════════════════════════════════════════ -->
+<div id="board-panel" class="card hidden">
+  <h2>Arrange the Board</h2>
+  <p class="hint">Drag objects from the palette onto the board. Move them freely and rotate with the blue handle. Set the target piece below before starting.</p>
+
+  <div class="board-workspace">
+    <!-- Object palette -->
+    <div class="palette-column">
+      <div class="palette-header">Objects</div>
+      <div id="piece-palette" class="piece-palette"></div>
+      <button class="btn btn-secondary btn-sm" onclick="clearBoard()" style="margin-top:.75rem;width:100%">Clear Board</button>
+    </div>
+
+    <!-- Board canvas -->
+    <div id="setup-board" class="portl-board">
+      <div class="board-empty-hint">Drag objects here to set up the board</div>
+    </div>
+  </div>
+
+  <!-- Target config (used by simulated teacher) -->
+  <div class="board-config-row">
+    <div class="form-group" style="flex:1">
+      <label>Target Piece <small>(simulated teacher will reinforce this)</small></label>
+      <select id="board-target-select" class="form-input">
+        <option value="">— Place objects first —</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="form-actions">
+    <button class="btn btn-secondary" onclick="backToSetup()">&larr; Back</button>
+    <button class="btn btn-primary"   onclick="startSession()">Start Session &rarr;</button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     PANEL 3 — Session
+═══════════════════════════════════════════════════════════ -->
+<div id="session-panel" class="hidden">
+
+  <!-- Header strip -->
+  <div class="session-header">
+    <div class="session-meta">
+      <span class="meta-badge" id="procedure-badge">—</span>
+      <span class="meta-badge meta-behavior" id="behavior-badge">—</span>
+    </div>
+    <div class="session-progress">
+      <span>Interval <strong id="current-interval">1</strong> of <strong id="total-intervals">3</strong></span>
+      <span>Reinforcers: <strong id="reinf-count">0</strong> / <strong id="reinf-target">10</strong></span>
+    </div>
+  </div>
+
+  <!-- Session board (locked) -->
+  <div class="card objects-area">
+    <h3>Board</h3>
+    <p class="hint" id="board-session-hint">Click a piece to record the learner's object contact.</p>
+    <div id="session-board" class="portl-board portl-board-session"></div>
+  </div>
+
+  <!-- Teacher controls -->
+  <div class="teacher-controls">
+    <div class="control-group">
+      <h3>Teacher Controls</h3>
+      <div class="controls-row">
+        <button id="click-btn" class="btn btn-click"  onclick="deliverClick()" disabled>CLICK <span class="key-hint">space</span></button>
+        <button id="block-btn" class="btn btn-block"  onclick="deliverBlock()" disabled>+ Block <span class="key-hint">b</span></button>
+        <button id="reset-btn" class="btn btn-reset"  onclick="recordReset()">Reset <span class="key-hint">r</span></button>
+      </div>
+    </div>
+    <div class="control-group">
+      <h3>Criterion Notes</h3>
+      <textarea id="criterion-notes" class="form-input notes-input" placeholder="What behavior are you currently reinforcing?"></textarea>
+    </div>
+  </div>
+
+  <!-- Learner feedback -->
+  <div id="learner-feedback" class="card learner-feedback hidden">
+    <h3>Simulated Teacher Response</h3>
+    <div id="teacher-response" class="teacher-response-area">Touch a piece on the board to begin…</div>
+    <div id="sd-indicator"    class="sd-indicator hidden"></div>
+    <div id="chain-progress"  class="chain-progress hidden"></div>
+    <p class="hint" style="margin-top:.75rem">Touch pieces on the board to discover what the teacher reinforces.</p>
+  </div>
+
+  <!-- Event log -->
+  <div class="card log-area">
+    <h3>Session Log</h3>
+    <div id="event-log" class="event-log"></div>
+  </div>
+
+  <!-- Interval break -->
+  <div id="break-panel" class="hidden card break-panel">
+    <h2>Interval Complete!</h2>
+    <p>Record your data and revise your plan.</p>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Behavior Count</label>
+        <input type="number" id="break-behavior-count" class="form-input" value="0" min="0">
+      </div>
+      <div class="form-group">
+        <label>Errors / No-responses</label>
+        <input type="number" id="break-errors" class="form-input" value="0" min="0">
+      </div>
+      <div class="form-group full-width">
+        <label>Plan for Next Interval</label>
+        <textarea id="break-plan" class="form-input notes-input" placeholder="Raise criteria? Change procedure? Note observations…"></textarea>
+      </div>
+    </div>
+    <div class="break-actions">
+      <button class="btn btn-primary" onclick="continueSession()">Continue to Next Interval</button>
+      <button class="btn btn-danger"  onclick="endSession()">End Session</button>
+    </div>
+  </div>
+
+  <!-- Summary -->
+  <div id="summary-panel" class="hidden card">
+    <h2>Session Complete</h2>
+    <div id="summary-content"></div>
+    <div class="break-actions">
+      <button class="btn btn-primary"   onclick="saveSession()">Save Session Log</button>
+      <button class="btn btn-secondary" onclick="location.reload()">New Session</button>
+    </div>
+  </div>
+
+</div><!-- /session-panel -->
+
+<div id="toast-container" class="toast-container"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/simulation.js') }}"></script>
+{% endblock %}

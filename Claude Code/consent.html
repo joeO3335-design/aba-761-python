@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Informed Consent — Endicott College IRB</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Times New Roman", Times, serif;
+      font-size: 16px;
+      line-height: 1.6;
+      background: #f4f4f4;
+      color: #111;
+    }
+
+    .page {
+      max-width: 800px;
+      margin: 40px auto;
+      background: #fff;
+      padding: 60px 70px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .header p {
+      font-weight: bold;
+      font-size: 1em;
+      line-height: 1.5;
+    }
+
+    /* Meta info grid */
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 4px 12px;
+      margin-bottom: 24px;
+      font-size: 0.95em;
+    }
+    .meta-grid .label { font-weight: normal; }
+    .meta-grid .value { border-bottom: 1px solid #555; padding: 0 4px; min-height: 22px; }
+
+    /* Section headings */
+    h2 {
+      font-size: 1em;
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-top: 20px;
+      margin-bottom: 6px;
+    }
+
+    p { margin-bottom: 12px; }
+
+    hr { border: none; border-top: 1px solid #ccc; margin: 24px 0; }
+
+    /* Initials / consent items table */
+    .consent-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      margin-bottom: 20px;
+      font-size: 0.95em;
+    }
+    .consent-table td {
+      border: 1px solid #555;
+      padding: 10px 14px;
+      vertical-align: top;
+    }
+    .consent-table .initials-cell {
+      width: 90px;
+      text-align: center;
+      vertical-align: middle;
+    }
+    .consent-table .initials-cell input[type="text"] {
+      width: 70px;
+      border: none;
+      border-bottom: 1px solid #333;
+      font-size: 1em;
+      text-align: center;
+      outline: none;
+      font-family: inherit;
+    }
+    .optional-header td {
+      background: #f0f0f0;
+      font-style: italic;
+    }
+    .checkbox-cell {
+      width: 90px;
+      text-align: center;
+      vertical-align: middle;
+    }
+    .checkbox-cell input[type="checkbox"] {
+      width: 20px;
+      height: 20px;
+      cursor: pointer;
+    }
+
+    /* Signature block */
+    .sig-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+      font-size: 0.95em;
+    }
+    .sig-table td {
+      border: 1px solid #555;
+      padding: 10px 14px;
+    }
+    .sig-table input[type="text"],
+    .sig-table input[type="date"] {
+      width: 100%;
+      border: none;
+      border-bottom: 1px solid #333;
+      font-size: 1em;
+      outline: none;
+      font-family: inherit;
+      background: transparent;
+    }
+
+    /* IRB footer */
+    .irb-footer {
+      text-align: center;
+      margin-top: 32px;
+      font-size: 0.88em;
+      color: #333;
+      border-top: 1px solid #ccc;
+      padding-top: 20px;
+    }
+    .irb-footer strong { display: block; margin-bottom: 4px; }
+
+    /* Submit button */
+    .submit-area {
+      text-align: center;
+      margin-top: 32px;
+    }
+    .submit-btn {
+      padding: 14px 48px;
+      font-size: 1em;
+      font-family: inherit;
+      background: #1a3a6b;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      letter-spacing: 0.04em;
+    }
+    .submit-btn:hover { background: #12285a; }
+
+    /* Validation error */
+    .error-msg {
+      color: #b00020;
+      font-size: 0.9em;
+      margin-top: 10px;
+      display: none;
+    }
+
+    /* Thank-you screen (hidden initially) */
+    #thank-you {
+      display: none;
+      max-width: 800px;
+      margin: 80px auto;
+      background: #fff;
+      padding: 60px 70px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+      text-align: center;
+    }
+    #thank-you h1 { font-size: 1.4em; margin-bottom: 16px; }
+    #thank-you p { font-size: 1em; color: #333; }
+  </style>
+</head>
+<body>
+
+<div class="page" id="consent-page">
+
+  <!-- ── Header ── -->
+  <div class="header">
+    <p>Endicott College Institutional Review Board (IRB)<br>
+       Informed Consent Form<br>
+       <em>Study Title: [Insert Study Title]</em></p>
+  </div>
+
+  <!-- ── Study meta info ── -->
+  <div class="meta-grid">
+    <span class="label">Date:</span>
+    <span class="value" id="auto-date"></span>
+
+    <span class="label">Principal Investigator:</span>
+    <span class="value">[Name, Title]</span>
+
+    <span class="label">Student Investigator(s):</span>
+    <span class="value">[Name(s)]</span>
+
+    <span class="label">Telephone:</span>
+    <span class="value">[Phone Number]</span>
+
+    <span class="label">Email:</span>
+    <span class="value">[Email Address]</span>
+  </div>
+
+  <!-- ── Introduction ── -->
+  <h2>Introduction</h2>
+  <p>Please read this form carefully. If you consent to take part, as a participant, in the
+     studies being undertaken by <strong>[Principal Investigator's Name]</strong>, then you
+     should complete this consent form. If you have any questions, or are unsure about anything,
+     you should not proceed until your concerns have been resolved and you are completely happy
+     to volunteer.</p>
+
+  <p>[In plain language, describe the reason for the study, the techniques being used, and the
+     practical details of participating in the study from the subject's perspective. Focus on
+     points relating to the subject's likely experience, and emphasize any risks involved and
+     how you will minimize those risks.]</p>
+
+  <p>[Explain any restrictions which will be placed on participants.]</p>
+
+  <!-- ── Participation ── -->
+  <h2>Participation</h2>
+  <p>You may at any time withdraw from the study. You do not have to give any reason, and no
+     one can attempt to dissuade you. If you ever require any further explanation, please do not
+     hesitate to ask.</p>
+
+  <!-- ── Risks ── -->
+  <h2>Risks</h2>
+  <p>There are no foreseeable risks involved in participating in this study other than those
+     minimal risks encountered in day-to-day life.</p>
+
+  <!-- ── Benefits ── -->
+  <h2>Benefits</h2>
+  <p>The benefits of your participation in this study are [insert information here]. The
+     benefits of this study in general are [insert information here].</p>
+
+  <!-- ── Withdrawal ── -->
+  <h2>Choosing to Withdraw from the Study</h2>
+  <p>Your consent and participation in this study are completely voluntary. You can withdraw
+     from the study for any reason at any time without consequences of any kind, and you can
+     withdraw your consent at any time without consequences of any kind. If you do choose to
+     withdraw at any time, your data will not be used by researchers. Please contact the
+     principal investigator should you wish for your data not to be used.</p>
+
+  <!-- ── Anonymity / Confidentiality ── -->
+  <h2>Anonymity / Confidentiality</h2>
+  <p>Data obtained during this study will not be able to be linked to your identity. Any
+     personal data obtained during this study will remain confidential as to your identity.
+     Other data, which cannot be connected to you, will be published or presented at meetings
+     with the aim of benefiting others.</p>
+
+  <p>This study has received approval in accordance with current University regulations.</p>
+
+  <p>For questions or concerns about this study, please contact <strong>[Principal Investigator
+     Name, Title, Contact Information]</strong>.</p>
+
+  <hr>
+
+  <!-- ── Required consent items (initials) ── -->
+  <p><strong>Please initial each statement below to indicate your agreement.</strong></p>
+
+  <table class="consent-table">
+    <tbody>
+      <tr>
+        <td>1. I confirm that I have read and understood the information above for the above
+            study. I confirm that I have had the opportunity to consider the information and
+            ask questions and that these have been answered satisfactorily.</td>
+        <td class="initials-cell">
+          <input type="text" id="init1" maxlength="5" placeholder="Initials" aria-label="Initials item 1" />
+        </td>
+      </tr>
+      <tr>
+        <td>2. I understand that my participation is voluntary and that I am free to withdraw
+            at any time without negative consequences without giving any reason.</td>
+        <td class="initials-cell">
+          <input type="text" id="init2" maxlength="5" placeholder="Initials" aria-label="Initials item 2" />
+        </td>
+      </tr>
+      <tr>
+        <td>3. I agree to take part in this study.</td>
+        <td class="initials-cell">
+          <input type="text" id="init3" maxlength="5" placeholder="Initials" aria-label="Initials item 3" />
+        </td>
+      </tr>
+      <tr>
+        <td>4. I understand that as a result of taking part in this study I will experience
+            [insert a brief summary of benefits and risks associated with taking part in the
+            study].</td>
+        <td class="initials-cell">
+          <input type="text" id="init4" maxlength="5" placeholder="Initials" aria-label="Initials item 4" />
+        </td>
+      </tr>
+      <tr>
+        <td>5. I understand that the results of this study may be published and/or presented
+            at meetings and may be provided to research sponsors or regulatory authorities.
+            I give my permission for my anonymous data, which does not identify me, to be
+            disseminated in this way. The information will be kept confidential with the
+            exception of information which must be reported under Massachusetts and Federal
+            law such as cases of child or elder abuse.</td>
+        <td class="initials-cell">
+          <input type="text" id="init5" maxlength="5" placeholder="Initials" aria-label="Initials item 5" />
+        </td>
+      </tr>
+
+      <!-- Optional items -->
+      <tr class="optional-header">
+        <td colspan="2">Additional optional consent (you can participate without consenting
+            to photographs or video):</td>
+      </tr>
+      <tr>
+        <td>6. I consent for photographs of me to be taken during the experiment for use in
+            scientific presentations and publications (with my identity obscured).</td>
+        <td class="checkbox-cell">
+          <input type="checkbox" id="opt6" aria-label="Optional consent item 6" />
+        </td>
+      </tr>
+      <tr>
+        <td>7. I consent for video/audio recordings of me to be taken during the experiment
+            for use by the study team only (my image will not be shown to others and will be
+            destroyed after the data has been analyzed).</td>
+        <td class="checkbox-cell">
+          <input type="checkbox" id="opt7" aria-label="Optional consent item 7" />
+        </td>
+      </tr>
+      <tr>
+        <td>8. I consent for video/audio recordings of me to be taken during the experiment
+            for use in scientific presentations and publications (my identity may not be
+            obscured).</td>
+        <td class="checkbox-cell">
+          <input type="checkbox" id="opt8" aria-label="Optional consent item 8" />
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Signature block ── -->
+  <table class="sig-table">
+    <tbody>
+      <tr>
+        <td><strong>Name of Participant:</strong><br>
+            <input type="text" id="participant-name" placeholder="Full name" /></td>
+        <td style="width:160px;"><strong>Date:</strong><br>
+            <input type="date" id="participant-date" /></td>
+        <td style="width:200px;"><strong>Signature (type full name):</strong><br>
+            <input type="text" id="participant-sig" placeholder="Type full name" /></td>
+      </tr>
+      <tr>
+        <td><strong>Name of Person Taking Consent:</strong><br>
+            <input type="text" id="consent-taker-name" placeholder="Full name" /></td>
+        <td><strong>Date:</strong><br>
+            <input type="date" id="consent-taker-date" /></td>
+        <td><strong>Signature (type full name):</strong><br>
+            <input type="text" id="consent-taker-sig" placeholder="Type full name" /></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ── Submit ── -->
+  <div class="submit-area">
+    <button class="submit-btn" onclick="submitConsent()">I Consent — Begin Study</button>
+    <p class="error-msg" id="error-msg">
+      Please initial all required items (1–5) and complete the participant name and signature
+      before proceeding.
+    </p>
+  </div>
+
+  <!-- ── IRB footer ── -->
+  <div class="irb-footer">
+    <strong>Institutional Review Board (IRB)</strong>
+    Endicott College<br>
+    376 Hale St, Beverly, MA 01915<br>
+    irb@endicott.edu
+    <p style="margin-top:12px; font-size:0.85em;">
+      This research project has been reviewed by the Institutional Review Board at Endicott
+      College in accordance with US Department of Health and Human Services Office of Human
+      Research Protections 45 CFR part 46 and does not constitute approval by the host
+      institution.
+    </p>
+  </div>
+
+</div><!-- /.page -->
+
+<!-- ── Thank-you / transition screen ── -->
+<div id="thank-you">
+  <h1>Thank you for consenting to participate.</h1>
+  <p>Your responses have been recorded. The experiment will begin shortly.</p>
+  <p style="margin-top:24px; color:#666; font-size:0.9em;">
+    [Experiment interface will load here]
+  </p>
+</div>
+
+<script>
+  // Auto-fill today's date in the meta block
+  document.getElementById("auto-date").textContent =
+    new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+
+  // Pre-fill participant date fields with today
+  const today = new Date().toISOString().split("T")[0];
+  document.getElementById("participant-date").value = today;
+  document.getElementById("consent-taker-date").value = today;
+
+  function submitConsent() {
+    const required = ["init1","init2","init3","init4","init5"];
+    const allInitialed = required.every(id => document.getElementById(id).value.trim() !== "");
+    const hasName = document.getElementById("participant-name").value.trim() !== "";
+    const hasSig  = document.getElementById("participant-sig").value.trim() !== "";
+
+    if (!allInitialed || !hasName || !hasSig) {
+      document.getElementById("error-msg").style.display = "block";
+      return;
+    }
+
+    // Collect consent record
+    const consentRecord = {
+      timestamp: new Date().toISOString(),
+      participantName: document.getElementById("participant-name").value.trim(),
+      participantSig:  document.getElementById("participant-sig").value.trim(),
+      participantDate: document.getElementById("participant-date").value,
+      consentTakerName: document.getElementById("consent-taker-name").value.trim(),
+      consentTakerSig:  document.getElementById("consent-taker-sig").value.trim(),
+      consentTakerDate: document.getElementById("consent-taker-date").value,
+      optPhoto:  document.getElementById("opt6").checked,
+      optVideoTeamOnly: document.getElementById("opt7").checked,
+      optVideoPublic:   document.getElementById("opt8").checked,
+    };
+
+    // Store in sessionStorage so the experiment page can access it
+    sessionStorage.setItem("consentRecord", JSON.stringify(consentRecord));
+
+    // Hide consent, show transition, then load experiment
+    document.getElementById("consent-page").style.display = "none";
+    document.getElementById("thank-you").style.display = "block";
+
+    // TODO: replace timeout with actual experiment page load
+    // setTimeout(() => { window.location.href = "experiment.html"; }, 2000);
+  }
+</script>
+
+</body>
+</html>
