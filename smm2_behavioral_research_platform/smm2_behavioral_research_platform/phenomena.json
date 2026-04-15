@@ -1,0 +1,142 @@
+{
+  "positive_reinforcement": {
+    "label": "Positive Reinforcement",
+    "events": [
+      {"key": "r", "label": "Response",            "code": "RESPONSE"},
+      {"key": "s", "label": "SR+ Delivered",        "code": "SR_PLUS"},
+      {"key": "n", "label": "No Response",           "code": "NR"},
+      {"key": "e", "label": "Error",                 "code": "ERROR"}
+    ]
+  },
+  "negative_reinforcement": {
+    "label": "Negative Reinforcement",
+    "events": [
+      {"key": "e", "label": "Escape Response",       "code": "ESCAPE"},
+      {"key": "a", "label": "Avoidance Response",    "code": "AVOIDANCE"},
+      {"key": "s", "label": "Aversive Removed",      "code": "SR_MINUS"},
+      {"key": "v", "label": "Aversive Present",      "code": "AVERSIVE"},
+      {"key": "n", "label": "No Response",           "code": "NR"}
+    ]
+  },
+  "reinforcement_schedules": {
+    "label": "Reinforcement Schedules",
+    "events": [
+      {"key": "r", "label": "Response",              "code": "RESPONSE"},
+      {"key": "s", "label": "SR+ Delivered",         "code": "SR_PLUS"},
+      {"key": "p", "label": "Post-SR Pause",         "code": "POST_SR_PAUSE"},
+      {"key": "b", "label": "Response Burst",        "code": "BURST"},
+      {"key": "n", "label": "No Response",           "code": "NR"}
+    ]
+  },
+  "extinction": {
+    "label": "Extinction",
+    "events": [
+      {"key": "r", "label": "Response",              "code": "RESPONSE"},
+      {"key": "b", "label": "Extinction Burst",      "code": "EXT_BURST"},
+      {"key": "e", "label": "Emotional Response",    "code": "EMOTIONAL"},
+      {"key": "s", "label": "Spontaneous Recovery",  "code": "SPONT_RECOVERY"},
+      {"key": "n", "label": "No Response",           "code": "NR"}
+    ]
+  },
+  "shaping": {
+    "label": "Shaping",
+    "events": [
+      {"key": "r", "label": "Response",              "code": "RESPONSE"},
+      {"key": "s", "label": "SR+ (Approximation)",   "code": "SR_APPROX"},
+      {"key": "c", "label": "Criterion Met",         "code": "CRITERION"},
+      {"key": "f", "label": "Failed Attempt",        "code": "FAIL"},
+      {"key": "u", "label": "Step Up",               "code": "STEP_UP"}
+    ]
+  },
+  "stimulus_control": {
+    "label": "Stimulus Control / Discrimination",
+    "events": [
+      {"key": "p", "label": "S+ Presented",          "code": "SD_PLUS"},
+      {"key": "m", "label": "S\u2212 Presented",     "code": "SD_MINUS"},
+      {"key": "r", "label": "Response to S+",        "code": "RESP_SD_PLUS"},
+      {"key": "e", "label": "Response to S\u2212",   "code": "RESP_SD_MINUS"},
+      {"key": "s", "label": "SR+ Delivered",         "code": "SR_PLUS"},
+      {"key": "c", "label": "Correct",               "code": "CORRECT"}
+    ]
+  },
+  "generalization": {
+    "label": "Generalization",
+    "events": [
+      {"key": "t", "label": "Training Stimulus",     "code": "TRAIN_STIM"},
+      {"key": "g", "label": "Novel Stimulus",        "code": "GEN_STIM"},
+      {"key": "r", "label": "Response",              "code": "RESPONSE"},
+      {"key": "n", "label": "No Response",           "code": "NR"},
+      {"key": "s", "label": "SR+ Delivered",         "code": "SR_PLUS"}
+    ]
+  },
+  "punishment": {
+    "label": "Punishment",
+    "events": [
+      {"key": "r", "label": "Target Response",       "code": "TARGET_RESP"},
+      {"key": "p", "label": "Punisher Delivered",    "code": "PUNISHER"},
+      {"key": "s", "label": "Response Suppressed",   "code": "SUPPRESSED"},
+      {"key": "e", "label": "Escape Attempt",        "code": "ESCAPE_ATT"},
+      {"key": "a", "label": "Aggression",            "code": "AGGRESSION"}
+    ]
+  },
+  "chaining": {
+    "label": "Behavioral Chaining",
+    "events": [
+      {"key": "1", "label": "Link 1",                "code": "LINK_1"},
+      {"key": "2", "label": "Link 2",                "code": "LINK_2"},
+      {"key": "3", "label": "Link 3",                "code": "LINK_3"},
+      {"key": "4", "label": "Link 4",                "code": "LINK_4"},
+      {"key": "c", "label": "Chain Complete",        "code": "CHAIN_COMPLETE"},
+      {"key": "b", "label": "Chain Break",           "code": "CHAIN_BREAK"}
+    ]
+  },
+  "matching_law": {
+    "label": "Matching Law",
+    "events": [
+      {"key": "l", "label": "Left Choice",           "code": "LEFT"},
+      {"key": "r", "label": "Right Choice",          "code": "RIGHT"},
+      {"key": "a", "label": "Left SR+ Delivered",    "code": "LEFT_SR"},
+      {"key": "d", "label": "Right SR+ Delivered",   "code": "RIGHT_SR"},
+      {"key": "s", "label": "Schedule Switch",       "code": "SCHED_SWITCH"},
+      {"key": "e", "label": "Exclusive Preference",  "code": "EXCLUSIVE"}
+    ]
+  },
+  "explore_exploit": {
+    "label": "Exploration vs. Exploitation",
+    "events": [
+      {"key": "b", "label": "Branch Point",          "code": "BRANCH_POINT"},
+      {"key": "x", "label": "Explore Choice",        "code": "EXPLORE"},
+      {"key": "p", "label": "Exploit Choice",        "code": "EXPLOIT"},
+      {"key": "r", "label": "Return to Known Path",  "code": "RETURN"},
+      {"key": "s", "label": "Reward Obtained",       "code": "REWARD"},
+      {"key": "o", "label": "No Reward",             "code": "NO_REWARD"},
+      {"key": "d", "label": "Dead End",              "code": "DEAD_END"}
+    ]
+  },
+
+  "behavioral_momentum": {
+    "label": "Behavioral Momentum",
+    "events": [
+      {"key": "r", "label": "Response (Rich zone)",  "code": "RESP_RICH"},
+      {"key": "l", "label": "Response (Lean zone)",  "code": "RESP_LEAN"},
+      {"key": "s", "label": "SR+ Delivered",         "code": "SR_PLUS"},
+      {"key": "d", "label": "Disruptor Onset",       "code": "DISRUPTOR"},
+      {"key": "p", "label": "Persist (post-disrupt)","code": "PERSIST"},
+      {"key": "x", "label": "Suppress (ceased)",     "code": "SUPPRESS"},
+      {"key": "f", "label": "Free Reinforcer",       "code": "FREE_SR"}
+    ]
+  },
+
+  "amelioration": {
+    "label": "Amelioration",
+    "events": [
+      {"key": "l", "label": "Left Choice",           "code": "LEFT"},
+      {"key": "r", "label": "Right Choice",          "code": "RIGHT"},
+      {"key": "a", "label": "Left SR+ Delivered",    "code": "LEFT_SR"},
+      {"key": "d", "label": "Right SR+ Delivered",   "code": "RIGHT_SR"},
+      {"key": "w", "label": "Shift → Richer option", "code": "SHIFT_RICH"},
+      {"key": "e", "label": "Exclusive Preference",  "code": "EXCLUSIVE"},
+      {"key": "q", "label": "Local Rate Equalized",  "code": "LOCAL_EQ"}
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "smm2_behavioral_research_platform"
+version = "0.0.1"
+description = "A platform for programmed instruction and behavioral data collection using Super Mario Maker 2"
+authors = [
+  { name = "joeott" },
+]
+
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    
+]
+requires-python = "~=3.10.0"
+
+
+[tool.ruff]
+line-length = 99
+src = ["smm2_behavioral_research_platform"]
+include = ["pyproject.toml", "smm2_behavioral_research_platform/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Add import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["smm2_behavioral_research_platform"]
+force-sort-within-sections = true
+
