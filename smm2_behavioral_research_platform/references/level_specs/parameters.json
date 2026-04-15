@@ -286,5 +286,211 @@
         "melioration_test": "P(switch_to_left | local_rate_left > local_rate_right) > P(switch_to_left | local_rate_left < local_rate_right)"
       }
     }
+  },
+
+  "concurrent_schedules": {
+    "spec_file": "14_concurrent_schedules.md",
+    "conditions": [
+      {
+        "condition": "CONC_FR_FR",
+        "left_schedule": "FR3", "right_schedule": "FR9",
+        "left_fr": 3, "right_fr": 9,
+        "richness_ratio": "3:1",
+        "path_length_equal": false,
+        "left_path_tiles": 6, "right_path_tiles": 18,
+        "COD": null
+      },
+      {
+        "condition": "CONC_VI_VI",
+        "left_schedule": "VI3s", "right_schedule": "VI9s",
+        "left_vi_mean_s": 3, "right_vi_mean_s": 9,
+        "left_vi_sequence_s": [1,4,2,5,3,4,1,6,2,4],
+        "right_vi_sequence_s": [5,12,7,11,9,8,10,13,6,9],
+        "richness_ratio": "3:1",
+        "path_length_equal": true, "path_tiles": 6,
+        "COD": null
+      },
+      {
+        "condition": "CONC_VI_VI_COD",
+        "left_schedule": "VI3s", "right_schedule": "VI9s",
+        "left_vi_mean_s": 3, "right_vi_mean_s": 9,
+        "path_length_equal": true, "path_tiles": 6,
+        "COD": 2
+      }
+    ],
+    "choices_per_condition": 40,
+    "session_order": "latin_square_counterbalanced",
+    "analysis": {
+      "model": "generalized_matching_law",
+      "equation": "log(B1/B2) = a * log(R1/R2) + log(b)",
+      "parameters": ["sensitivity_a", "bias_b"],
+      "COD_comparison": "switching_rate and matching_fit with vs. without COD"
+    }
+  },
+
+  "alternative_schedules": {
+    "spec_file": "15_alternative_schedules.md",
+    "conditions": [
+      {
+        "condition": "ALT_FR5_FI10s",
+        "FR_requirement": 5, "FI_requirement_s": 10,
+        "path_length_tiles": 16, "expected_winner": "variable"
+      },
+      {
+        "condition": "ALT_FR3_FI20s",
+        "FR_requirement": 3, "FI_requirement_s": 20,
+        "path_length_tiles": 30, "expected_winner": "FR"
+      },
+      {
+        "condition": "ALT_FR20_FI5s",
+        "FR_requirement": 20, "FI_requirement_s": 5,
+        "path_length_tiles": 30, "expected_winner": "FI"
+      }
+    ],
+    "trials_per_condition": 20,
+    "session_order": "latin_square_counterbalanced",
+    "walk_speed_tiles_per_s": 1.33,
+    "analysis": {
+      "primary_dv": "proportion_first_FR_vs_first_FI",
+      "secondary_dvs": ["response_rate_per_trial", "latency_to_SR"]
+    }
+  },
+
+  "conjunctive_schedules": {
+    "spec_file": "16_conjunctive_schedules.md",
+    "conditions": [
+      {
+        "condition": "pure_FR3",     "FR_requirement": 3,  "FI_requirement_s": null },
+      {
+        "condition": "pure_FI8s",    "FR_requirement": null,"FI_requirement_s": 8   },
+      {
+        "condition": "CONJ_FR3_FI8s","FR_requirement": 3,  "FI_requirement_s": 8,
+        "binding_constraint": "FI"  },
+      {
+        "condition": "CONJ_FR3_FI3s","FR_requirement": 3,  "FI_requirement_s": 3,
+        "binding_constraint": "tied"},
+      {
+        "condition": "CONJ_FR8_FI3s","FR_requirement": 8,  "FI_requirement_s": 3,
+        "binding_constraint": "FR"  }
+    ],
+    "trials_per_condition": 20,
+    "analysis": {
+      "primary_dvs": ["inter_reinforcement_interval_s", "response_rate_per_min"],
+      "secondary_dvs": ["binding_constraint_proportion", "post_FR_pause_s"]
+    }
+  },
+
+  "multiple_schedules": {
+    "spec_file": "17_multiple_schedules.md",
+    "component_1": {
+      "SD": "night_filter",
+      "schedule": "VI5s",
+      "vi_mean_s": 5,
+      "vi_sequence_s": [2,7,4,8,5,6,3,9,4,6],
+      "segment_duration_s": 20,
+      "blocks_per_segment": 10
+    },
+    "component_2": {
+      "SD": "sunset_filter",
+      "schedule_baseline": "EXT",
+      "schedule_contrast": "VI5s",
+      "segment_duration_s": 20,
+      "blocks_per_segment": 10
+    },
+    "phases": [
+      {"phase": "A1", "c2_schedule": "EXT",  "component_exposures": 15},
+      {"phase": "B",  "c2_schedule": "VI5s", "component_exposures": 15},
+      {"phase": "A2", "c2_schedule": "EXT",  "component_exposures": 15}
+    ],
+    "design": "ABA_reversal",
+    "analysis": {
+      "primary_dv": "response_rate_by_component_and_phase",
+      "contrast_index": "(C1_rate_A1 - C1_rate_B) / C1_rate_A1",
+      "discrimination_index": "(R1 - R2) / (R1 + R2)"
+    }
+  },
+
+  "mixed_schedules": {
+    "spec_file": "18_mixed_schedules.md",
+    "component_1": {
+      "SD": null,
+      "visual_cue": "ground_day_no_filter",
+      "schedule": "VI5s",
+      "vi_mean_s": 5,
+      "vi_sequence_s": [2,7,4,8,5,6,3,9,4,6],
+      "segment_duration_s": 20,
+      "blocks_per_segment": 10
+    },
+    "component_2": {
+      "SD": null,
+      "visual_cue": "ground_day_no_filter",
+      "schedule": "EXT",
+      "segment_duration_s": 20,
+      "blocks_per_segment": 10
+    },
+    "alternations_per_session": 4,
+    "comparison_condition": "multiple_schedules",
+    "analysis": {
+      "primary_dv": "EXT_component_response_rate_MIX_vs_MULT",
+      "discrimination_index": "(R_VI - R_EXT) / (R_VI + R_EXT)",
+      "within_session_learning": "regression_of_EXT_rate_on_segment_number"
+    }
+  },
+
+  "chained_schedules": {
+    "spec_file": "19_chained_schedules.md",
+    "conditions": [
+      {
+        "condition": "CHAIN_FR3_FR3",
+        "link_1": {"schedule": "FR3", "fr_value": 3, "SD": "ground_day", "SR": "blue_coins_pswitch"},
+        "link_2": {"schedule": "FR3", "fr_value": 3, "SD": "blue_coins_active", "SR": "star_primary"},
+        "pswitch_duration_s": 10
+      },
+      {
+        "condition": "CHAIN_FR5_FR3",
+        "link_1": {"schedule": "FR5", "fr_value": 5, "SD": "ground_day", "SR": "blue_coins_pswitch"},
+        "link_2": {"schedule": "FR3", "fr_value": 3, "SD": "blue_coins_active", "SR": "star_primary"},
+        "pswitch_duration_s": 10
+      },
+      {
+        "condition": "CHAIN_FR3_FR5",
+        "link_1": {"schedule": "FR3", "fr_value": 3, "SD": "ground_day", "SR": "blue_coins_pswitch"},
+        "link_2": {"schedule": "FR5", "fr_value": 5, "SD": "blue_coins_active", "SR": "star_primary"},
+        "pswitch_duration_s": 10
+      }
+    ],
+    "trials_per_condition": 20,
+    "comparison_condition": "tandem_schedules",
+    "analysis": {
+      "primary_dvs": ["goal_gradient_IRT", "link1_response_rate", "trial_completion_rate"],
+      "chain_vs_tand": "L1_rate_CHAIN > L1_rate_TAND (conditioned SR effect)"
+    }
+  },
+
+  "tandem_schedules": {
+    "spec_file": "20_tandem_schedules.md",
+    "conditions": [
+      {
+        "condition": "TAND_FR3_FR3",
+        "comp_1": {"schedule": "FR3", "fr_value": 3, "SD_change_at_completion": false},
+        "comp_2": {"schedule": "FR3", "fr_value": 3, "SR": "coin_primary"}
+      },
+      {
+        "condition": "TAND_FR5_FR3",
+        "comp_1": {"schedule": "FR5", "fr_value": 5, "SD_change_at_completion": false},
+        "comp_2": {"schedule": "FR3", "fr_value": 3, "SR": "coin_primary"}
+      },
+      {
+        "condition": "TAND_FR3_FI8s",
+        "comp_1": {"schedule": "FR3", "fr_value": 3, "SD_change_at_completion": false},
+        "comp_2": {"schedule": "FI8s", "fi_s": 8, "SR": "coin_primary"}
+      }
+    ],
+    "trials_per_condition": 20,
+    "comparison_condition": "chained_schedules",
+    "analysis": {
+      "primary_dvs": ["IRT_across_components", "post_comp1_pause_s", "trial_duration_s"],
+      "tand_vs_chain": "flat_IRT_in_TAND vs. accelerating_IRT_in_CHAIN"
+    }
   }
 }

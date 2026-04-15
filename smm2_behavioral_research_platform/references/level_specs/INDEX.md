@@ -23,6 +23,18 @@ Course IDs are populated after uploading completed levels to SMM2.
 | 12 | Behavioral Momentum | [12_behavioral_momentum.md](12_behavioral_momentum.md) | Rich vs. lean track + disruptor | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
 | 13 | Amelioration | [13_amelioration.md](13_amelioration.md) | Concurrent FR-FR vs. VI-VI fork | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
 
+### Compound Schedules Module (14–20)
+
+| # | Phenomenon | Spec File | Key Mechanic | Demo Level ID | Research Level ID |
+|---|---|---|---|---|---|
+| 14 | Concurrent Schedules (CONC) | [14_concurrent_schedules.md](14_concurrent_schedules.md) | Free-choice fork + COD | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 15 | Alternative Schedules (ALT) | [15_alternative_schedules.md](15_alternative_schedules.md) | FR race vs. FI timer | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 16 | Conjunctive Schedules (CONJ) | [16_conjunctive_schedules.md](16_conjunctive_schedules.md) | P-switch gate + FR hits | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 17 | Multiple Schedules (MULT) | [17_multiple_schedules.md](17_multiple_schedules.md) | Night/sunset SD alternation | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 18 | Mixed Schedules (MIX) | [18_mixed_schedules.md](18_mixed_schedules.md) | Unsignaled VI/EXT alternation | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 19 | Chained Schedules (CHAIN) | [19_chained_schedules.md](19_chained_schedules.md) | P-switch blue coins as CRF | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+| 20 | Tandem Schedules (TAND) | [20_tandem_schedules.md](20_tandem_schedules.md) | Silent sequential FR + FI | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+
 ---
 
 ## Files in This Directory
@@ -31,7 +43,7 @@ Course IDs are populated after uploading completed levels to SMM2.
 |---|---|
 | [TEMPLATE.md](TEMPLATE.md) | Blank spec template for new phenomena |
 | [parameters.json](parameters.json) | Machine-readable IV parameters for all levels (used by analysis notebooks) |
-| `01_positive_reinforcement.md` through `11_explore_exploit.md` | Full level specs |
+| `01_positive_reinforcement.md` through `20_tandem_schedules.md` | Full level specs |
 
 ---
 
@@ -55,6 +67,13 @@ exported CSV `phenomenon` column.
 | `explore_exploit` | Exploration vs. Exploitation |
 | `behavioral_momentum` | Behavioral Momentum |
 | `amelioration` | Amelioration |
+| `concurrent_schedules` | Concurrent Schedules (CONC) |
+| `alternative_schedules` | Alternative Schedules (ALT) |
+| `conjunctive_schedules` | Conjunctive Schedules (CONJ) |
+| `multiple_schedules` | Multiple Schedules (MULT) |
+| `mixed_schedules` | Mixed Schedules (MIX) |
+| `chained_schedules` | Chained Schedules (CHAIN) |
+| `tandem_schedules` | Tandem Schedules (TAND) |
 
 ---
 

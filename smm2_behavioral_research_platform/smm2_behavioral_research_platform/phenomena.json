@@ -138,5 +138,94 @@
       {"key": "e", "label": "Exclusive Preference",  "code": "EXCLUSIVE"},
       {"key": "q", "label": "Local Rate Equalized",  "code": "LOCAL_EQ"}
     ]
+  },
+
+  "concurrent_schedules": {
+    "label": "Concurrent Schedules (CONC)",
+    "events": [
+      {"key": "l", "label": "Response — Alt 1 (Left)",  "code": "L_RESP"},
+      {"key": "r", "label": "Response — Alt 2 (Right)", "code": "R_RESP"},
+      {"key": "a", "label": "SR+ — Alt 1",              "code": "L_SR"},
+      {"key": "d", "label": "SR+ — Alt 2",              "code": "R_SR"},
+      {"key": "s", "label": "Switch Alternatives",       "code": "SWITCH"},
+      {"key": "c", "label": "Changeover Response",       "code": "CHANGEOVER"},
+      {"key": "n", "label": "No Response (pause)",       "code": "NR"}
+    ]
+  },
+
+  "alternative_schedules": {
+    "label": "Alternative Schedules (ALT)",
+    "events": [
+      {"key": "r", "label": "Response (FR component)",  "code": "RESP_FR"},
+      {"key": "t", "label": "Interval elapsed (FI met)","code": "FI_MET"},
+      {"key": "f", "label": "FR requirement met",       "code": "FR_MET"},
+      {"key": "s", "label": "SR+ Delivered",            "code": "SR"},
+      {"key": "1", "label": "FR was first to satisfy",  "code": "FIRST_FR"},
+      {"key": "2", "label": "FI was first to satisfy",  "code": "FIRST_FI"},
+      {"key": "n", "label": "No Response",              "code": "NR"}
+    ]
+  },
+
+  "conjunctive_schedules": {
+    "label": "Conjunctive Schedules (CONJ)",
+    "events": [
+      {"key": "r", "label": "Response (counts FR)",     "code": "RESP"},
+      {"key": "f", "label": "FR component met",         "code": "FR_MET"},
+      {"key": "t", "label": "FI component met",         "code": "FI_MET"},
+      {"key": "b", "label": "Both met — SR+ delivered", "code": "BOTH_MET"},
+      {"key": "s", "label": "SR+ Delivered",            "code": "SR"},
+      {"key": "x", "label": "FR met, FI still pending", "code": "WAIT_FI"},
+      {"key": "y", "label": "FI met, FR still pending", "code": "WAIT_FR"}
+    ]
+  },
+
+  "multiple_schedules": {
+    "label": "Multiple Schedules (MULT)",
+    "events": [
+      {"key": "1", "label": "SD1 Present (Sched 1)",    "code": "SD1"},
+      {"key": "2", "label": "SD2 Present (Sched 2)",    "code": "SD2"},
+      {"key": "r", "label": "Response during SD1",      "code": "RESP_1"},
+      {"key": "e", "label": "Response during SD2",      "code": "RESP_2"},
+      {"key": "s", "label": "SR+ in Sched 1",           "code": "SR_1"},
+      {"key": "x", "label": "SR omitted in Sched 2",    "code": "OMIT_2"},
+      {"key": "p", "label": "Post-SR pause",            "code": "PAUSE"}
+    ]
+  },
+
+  "mixed_schedules": {
+    "label": "Mixed Schedules (MIX)",
+    "events": [
+      {"key": "r", "label": "Response",                 "code": "RESPONSE"},
+      {"key": "s", "label": "SR+ Delivered",            "code": "SR"},
+      {"key": "p", "label": "Post-SR pause",            "code": "PAUSE"},
+      {"key": "b", "label": "Response Burst",           "code": "BURST"},
+      {"key": "n", "label": "No Response",              "code": "NR"},
+      {"key": "c", "label": "Schedule component change","code": "COMP_CHANGE"}
+    ]
+  },
+
+  "chained_schedules": {
+    "label": "Chained Schedules (CHAIN)",
+    "events": [
+      {"key": "1", "label": "Response — Link 1",        "code": "L1_RESP"},
+      {"key": "a", "label": "Link 1 SR (SD2 onset)",    "code": "L1_SR"},
+      {"key": "2", "label": "Response — Link 2",        "code": "L2_RESP"},
+      {"key": "b", "label": "Link 2 SR (SD3 onset)",    "code": "L2_SR"},
+      {"key": "3", "label": "Response — Link 3",        "code": "L3_RESP"},
+      {"key": "t", "label": "Terminal SR+ (primary)",   "code": "TERM_SR"},
+      {"key": "x", "label": "Chain break / reset",      "code": "CHAIN_BREAK"}
+    ]
+  },
+
+  "tandem_schedules": {
+    "label": "Tandem Schedules (TAND)",
+    "events": [
+      {"key": "r", "label": "Response",                 "code": "RESPONSE"},
+      {"key": "1", "label": "Component 1 completed",    "code": "COMP1_DONE"},
+      {"key": "2", "label": "Component 2 completed",    "code": "COMP2_DONE"},
+      {"key": "t", "label": "Terminal SR+ delivered",   "code": "TERM_SR"},
+      {"key": "p", "label": "Pause (≥3 s no response)", "code": "PAUSE"},
+      {"key": "x", "label": "Reset (error / timeout)",  "code": "RESET"}
+    ]
   }
 }
