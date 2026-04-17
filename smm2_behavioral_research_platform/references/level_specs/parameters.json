@@ -492,5 +492,33 @@
       "primary_dvs": ["IRT_across_components", "post_comp1_pause_s", "trial_duration_s"],
       "tand_vs_chain": "flat_IRT_in_TAND vs. accelerating_IRT_in_CHAIN"
     }
+  },
+
+  "delay_discounting": {
+    "spec_file": "21_delay_discounting.md",
+    "paradigm": "fixed_amount_varying_delay",
+    "ss_amount_coins": 1,
+    "ll_amount_coins": 5,
+    "ss_delay_s": 1,
+    "ss_path_tiles": 1,
+    "walk_speed_tiles_per_s": 1.33,
+    "conditions": [
+      {"condition": "D_3s",  "ll_delay_s": 3,  "ll_path_tiles": 4},
+      {"condition": "D_10s", "ll_delay_s": 10, "ll_path_tiles": 13},
+      {"condition": "D_20s", "ll_delay_s": 20, "ll_path_tiles": 27},
+      {"condition": "D_40s", "ll_delay_s": 40, "ll_path_tiles": 53},
+      {"condition": "D_60s", "ll_delay_s": 60, "ll_path_tiles": 80}
+    ],
+    "trials_per_condition": 20,
+    "session_order": "latin_square_counterbalanced",
+    "analysis": {
+      "primary_dv": "proportion_LL_choices",
+      "model": "hyperbolic_discounting",
+      "equation": "V = A / (1 + k*D)",
+      "indifference_formula": "k = (A_LL/A_SS - 1) / D_50%  (=  4 / D_50% for A_LL=5, A_SS=1)",
+      "model_comparison": ["hyperbolic", "exponential"],
+      "fit_method": "nonlinear_least_squares",
+      "expected_group_k_range": [0.01, 1.0]
+    }
   }
 }

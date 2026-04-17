@@ -35,6 +35,14 @@ Course IDs are populated after uploading completed levels to SMM2.
 | 19 | Chained Schedules (CHAIN) | [19_chained_schedules.md](19_chained_schedules.md) | P-switch blue coins as CRF | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
 | 20 | Tandem Schedules (TAND) | [20_tandem_schedules.md](20_tandem_schedules.md) | Silent sequential FR + FI | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
 
+### Choice & Self-Control Module (21)
+
+| # | Phenomenon | Spec File | Key Mechanic | Demo Level ID | Research Level ID |
+|---|---|---|---|---|---|
+| 21 | Delay Discounting | [21_delay_discounting.md](21_delay_discounting.md) | SS/LL fork with variable delay corridor | XXXX-XXXX-XXXX-XXXX | XXXX-XXXX-XXXX-XXXX |
+
+> **Related existing specs**: Melioration (see [13_amelioration.md](13_amelioration.md) — amelioration and melioration are used interchangeably in Herrnstein & Vaughan, 1980). Behavioral Momentum = [12_behavioral_momentum.md](12_behavioral_momentum.md).
+
 ---
 
 ## Files in This Directory
@@ -74,6 +82,8 @@ exported CSV `phenomenon` column.
 | `mixed_schedules` | Mixed Schedules (MIX) |
 | `chained_schedules` | Chained Schedules (CHAIN) |
 | `tandem_schedules` | Tandem Schedules (TAND) |
+| `delay_discounting` | Delay Discounting |
+| `melioration` | (alias of `amelioration` — same level/events) |
 
 ---
 

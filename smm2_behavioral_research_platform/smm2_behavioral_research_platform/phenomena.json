@@ -227,5 +227,32 @@
       {"key": "p", "label": "Pause (≥3 s no response)", "code": "PAUSE"},
       {"key": "x", "label": "Reset (error / timeout)",  "code": "RESET"}
     ]
+  },
+
+  "delay_discounting": {
+    "label": "Delay Discounting",
+    "events": [
+      {"key": "s", "label": "SS Choice (1 coin, immediate)",    "code": "SS_CHOICE"},
+      {"key": "l", "label": "LL Choice (5 coins, delayed)",     "code": "LL_CHOICE"},
+      {"key": "a", "label": "SS SR+ delivered",                 "code": "SS_SR"},
+      {"key": "d", "label": "LL SR+ delivered",                 "code": "LL_SR"},
+      {"key": "r", "label": "Impulsive Reversal (LL→SS)",       "code": "IMPULSIVE_REVERSAL"},
+      {"key": "p", "label": "Wait Pause (≥3 s in LL corridor)", "code": "WAIT_PAUSE"},
+      {"key": "x", "label": "Abandoned LL (retreated)",         "code": "ABANDON_LL"}
+    ]
+  },
+
+  "melioration": {
+    "label": "Melioration (alias for Amelioration)",
+    "_alias_of": "amelioration",
+    "events": [
+      {"key": "l", "label": "Left Choice",           "code": "LEFT"},
+      {"key": "r", "label": "Right Choice",          "code": "RIGHT"},
+      {"key": "a", "label": "Left SR+ Delivered",    "code": "LEFT_SR"},
+      {"key": "d", "label": "Right SR+ Delivered",   "code": "RIGHT_SR"},
+      {"key": "w", "label": "Shift → Richer option", "code": "SHIFT_RICH"},
+      {"key": "e", "label": "Exclusive Preference",  "code": "EXCLUSIVE"},
+      {"key": "q", "label": "Local Rate Equalized",  "code": "LOCAL_EQ"}
+    ]
   }
 }
