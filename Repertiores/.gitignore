@@ -1,0 +1,14 @@
+# Never commit learner data — it contains PHI (names, DOBs, behavior records).
+data/
+
+# Demo media / screencasts (large binaries; mp4 already ignored repo-wide).
+docs/media/
+*.mp4
+*.webm
+*.m4a
+
+# Python / Streamlit cruft
+__pycache__/
+*.pyc
+*.tmp
+.streamlit/secrets.toml
