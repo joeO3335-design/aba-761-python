@@ -8,4 +8,13 @@ font = "sans serif"
 
 [client]
 toolbarMode = "minimal"
-showErrorDetails = true
+# Don't leak tracebacks / filesystem paths / variable contents to the UI.
+# Flip back to true only while actively debugging locally.
+showErrorDetails = false
+
+[server]
+# Bind to loopback only — the app is not reachable from the network, so
+# learner data is protected by the machine's own login (no in-app auth).
+address = "127.0.0.1"
+headless = true
+# XSRF protection stays on (Streamlit default).
