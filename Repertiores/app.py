@@ -19,11 +19,25 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 # ── Config ───────────────────────────────────────────────────────────────────
 DEV_MODE = True
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Single data store shared by both `streamlit run` (dev) and the packaged .app:
+#   ~/Library/Application Support/Repertiores/data
+# so there is one source of truth instead of two copies that drift apart. The
+# desktop launcher sets REPERTIORES_DATA_DIR to this same path; the env var
+# overrides the default, which is handy for pointing tests at a scratch dir.
+def _default_data_dir() -> str:
+    support = os.path.join(
+        os.path.expanduser("~"),
+        "Library", "Application Support", "Repertiores",
+    )
+    return os.path.join(support, "data")
+
+
+DATA_DIR = os.environ.get("REPERTIORES_DATA_DIR") or _default_data_dir()
 STUDENTS_FILE = os.path.join(DATA_DIR, "students.json")
 TARGETS_FILE = os.path.join(DATA_DIR, "targets.json")
 PROBES_FILE = os.path.join(DATA_DIR, "probes.json")
@@ -33,6 +47,7 @@ SUBMISSIONS_FILE = os.path.join(DATA_DIR, "submissions.json")
 BEHAVIORS_FILE = os.path.join(DATA_DIR, "behaviors.json")
 BEHAVIOR_RECORDS_FILE = os.path.join(DATA_DIR, "behavior_records.json")
 TARGET_BANK_FILE = os.path.join(DATA_DIR, "target_bank.json")
+INTERVENTION_BANK_FILE = os.path.join(DATA_DIR, "intervention_bank.json")
 PHASES_FILE = os.path.join(DATA_DIR, "phases.json")
 BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
 # Per-save automatic snapshots of every data file live in a subfolder so they
@@ -483,6 +498,119 @@ def load_target_bank() -> list[dict[str, Any]]:
 
 
 def save_target_bank(rows): _save(TARGET_BANK_FILE, rows)
+
+
+# ── Intervention bank ─────────────────────────────────────────────────────────
+# Category -> short descriptor shown under the heading.
+INTERVENTION_CATEGORIES = {
+    "Antecedent Manipulation": "stimulus control / motivation",
+    "Consequence Manipulation": "reinforcer / extinction / punishment",
+}
+# Seeded on first use; users can add/remove from the Intervention Bank page.
+DEFAULT_INTERVENTIONS = [
+    ("Antecedent Manipulation", "Increase pairing"),
+    ("Antecedent Manipulation", "Reduce # of demands (↑VR)"),
+    ("Antecedent Manipulation", "Increase # of easy skills interspersed"),
+    ("Antecedent Manipulation", "Decrease response effort"),
+    ("Antecedent Manipulation", "Further reduce errors (modify prompt procedures)"),
+    ("Antecedent Manipulation", "Change instruction pace (ITI)"),
+    ("Antecedent Manipulation", "Decrease/increase session time"),
+    ("Antecedent Manipulation", "Conduct Sr+ assessment"),
+    ("Antecedent Manipulation", "Change field of stimuli"),
+    ("Antecedent Manipulation", "Increase # of teaching trials"),
+    ("Antecedent Manipulation", "Change physical environment"),
+    ("Antecedent Manipulation", "Change aim"),
+    ("Antecedent Manipulation", "Teach pre-requisite skills"),
+    ("Antecedent Manipulation", "Decrease # of goals/objectives"),
+    ("Antecedent Manipulation", "Build MO by deprivation of specific reinforcers"),
+    ("Antecedent Manipulation", "Change teaching procedure"),
+    ("Consequence Manipulation", "Provide more valuable reinforcer"),
+    ("Consequence Manipulation", "Provide higher rate of reinforcement (lower VR)"),
+    ("Consequence Manipulation", "Reinforce immediately"),
+    ("Consequence Manipulation", "Provide a greater magnitude of reinforcement"),
+    ("Consequence Manipulation", "Reinforce on transfer trials"),
+    ("Consequence Manipulation", "Better use of extinction"),
+    ("Consequence Manipulation", "Improve the implementation of differential reinforcement"),
+]
+
+
+def load_intervention_bank() -> list[dict[str, Any]]:
+    """Load the intervention bank, seeding the defaults on first use."""
+    rows = _load(INTERVENTION_BANK_FILE)
+    if not rows:
+        rows = [
+            {"id": new_id(), "category": cat, "name": name, "created_at": now_iso()}
+            for cat, name in DEFAULT_INTERVENTIONS
+        ]
+        _save(INTERVENTION_BANK_FILE, rows)
+    return rows
+
+
+def save_intervention_bank(rows): _save(INTERVENTION_BANK_FILE, rows)
+
+
+def add_intervention_to_bank(category: str, name: str) -> dict | None:
+    """Add a new intervention to the bank, de-duped by (category, name)."""
+    name = name.strip()
+    category = category.strip()
+    if not name or not category:
+        return None
+    bank = load_intervention_bank()
+    key = (category.lower(), name.lower())
+    if any((b["category"].lower(), b["name"].lower()) == key for b in bank):
+        return None
+    rec = {"id": new_id(), "category": category, "name": name,
+           "created_at": now_iso()}
+    bank.append(rec)
+    save_intervention_bank(bank)
+    return rec
+
+
+def attach_intervention(
+    behavior_id: str, student_id: str, intervention: dict,
+    start_date: str, notes: str, make_phase: bool,
+) -> None:
+    """Record an intervention on a behavior, optionally as a graph phase line."""
+    behaviors = load_behaviors()
+    for b in behaviors:
+        if b["id"] != behavior_id:
+            continue
+        phase_id = ""
+        if make_phase:
+            ph = add_phase(
+                student_id, start_date, intervention["name"], notes, behavior_id,
+            )
+            phase_id = ph["id"]
+        b.setdefault("interventions", []).append({
+            "id": new_id(),
+            "intervention_id": intervention.get("id", ""),
+            "name": intervention["name"],
+            "category": intervention.get("category", ""),
+            "start_date": start_date,
+            "notes": notes.strip(),
+            "phase_id": phase_id,
+            "created_at": now_iso(),
+        })
+        save_behaviors(behaviors)
+        return
+
+
+def detach_intervention(behavior_id: str, attach_id: str) -> None:
+    """Remove an attached intervention (and its phase line, if any)."""
+    behaviors = load_behaviors()
+    for b in behaviors:
+        if b["id"] != behavior_id:
+            continue
+        keep = []
+        for iv in b.get("interventions", []):
+            if iv.get("id") == attach_id:
+                if iv.get("phase_id"):
+                    delete_phase(iv["phase_id"])
+                continue
+            keep.append(iv)
+        b["interventions"] = keep
+        save_behaviors(behaviors)
+        return
 
 
 def load_phases() -> list[dict[str, Any]]:
@@ -1930,6 +2058,107 @@ def _render_operant_body(
             f"⏱ **Avg rate of acquisition: {avg_d:.1f} days** "
             f"from introduction to mastery (n = {n_eligible})"
         )
+
+    # ── Duplicates within this operant (skill list ignored) ──────────────────
+    dup_map: dict[str, list[dict]] = {}
+    for t in op_targets:
+        dup_map.setdefault(t["description"].strip().lower(), []).append(t)
+    dup_map = {k: v for k, v in dup_map.items() if len(v) > 1}
+    if dup_map:
+        n_extra = sum(len(v) - 1 for v in dup_map.values())
+        with st.expander(
+            f"🔁 {len(dup_map)} duplicate description(s) in {op} "
+            f"({n_extra} extra cop{'y' if n_extra == 1 else 'ies'})",
+            expanded=False,
+        ):
+            st.caption(
+                "Targets whose description repeats within this operant (skill "
+                "list ignored). Check the copies to remove — leave at least one "
+                "per group. Removing a mastered copy also corrects the "
+                "cumulative count."
+            )
+            d_rows: list[dict] = []
+            d_ids: list[str] = []
+            for desc, members in sorted(dup_map.items()):
+                for m in sorted(
+                    members,
+                    key=lambda t: ((t.get("skill_list") or "").lower(), t.get("status", "")),
+                ):
+                    d_ids.append(m["id"])
+                    d_rows.append({
+                        "Select": False,
+                        "Target": m["description"],
+                        "List": m.get("skill_list", "") or "—",
+                        "Status": m.get("status", ""),
+                        "Mastered": mastered_date_label(m) or "—",
+                    })
+            d_ver = st.session_state.get(f"dup_ver_{sid}_{op}", 0)
+            d_edited = st.data_editor(
+                pd.DataFrame(d_rows),
+                width="stretch",
+                hide_index=True,
+                key=f"dup_editor_{sid}_{op}_{d_ver}",
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("✓", default=False),
+                    "Target": st.column_config.TextColumn(disabled=True),
+                    "List": st.column_config.TextColumn(disabled=True),
+                    "Status": st.column_config.TextColumn(disabled=True),
+                    "Mastered": st.column_config.TextColumn(disabled=True),
+                },
+            )
+            d_sel = [
+                d_ids[i]
+                for i, r in enumerate(d_edited.to_dict("records"))
+                if r.get("Select")
+            ]
+            d_pending = f"dup_pending_{sid}_{op}"
+            if not st.session_state.get(d_pending):
+                if st.button(
+                    f"🗑️ Remove {len(d_sel)} selected duplicate(s)",
+                    key=f"dup_del_btn_{sid}_{op}",
+                    disabled=not d_sel,
+                    width="stretch",
+                ):
+                    st.session_state[d_pending] = d_sel
+                    st.rerun()
+            else:
+                ids_set = set(st.session_state[d_pending])
+                sel_targets = [t for t in op_targets if t["id"] in ids_set]
+                n_mast = sum(1 for t in sel_targets if t.get("status") == "Mastered")
+                note = (
+                    f" {n_mast} mastered will drop the cumulative count."
+                    if n_mast else ""
+                )
+                st.warning(f"**Remove {len(ids_set)} duplicate target(s)?**{note}")
+                cyes, cno = st.columns(2)
+                with cyes:
+                    if st.button(
+                        "Yes, remove",
+                        key=f"dup_del_yes_{sid}_{op}",
+                        type="primary", width="stretch",
+                    ):
+                        for t in sel_targets:
+                            if t.get("status") == "Mastered":
+                                log_mastery_event(
+                                    t["student_id"], t["id"], "unmastered",
+                                )
+                        delete_targets(ids_set, reason=f"dedup_{op}")
+                        st.session_state.pop(d_pending, None)
+                        st.session_state[f"dup_ver_{sid}_{op}"] = d_ver + 1
+                        st.toast(
+                            f"Removed {len(ids_set)} duplicate(s). "
+                            "Undo at the top of the page."
+                        )
+                        st.rerun()
+                with cno:
+                    if st.button(
+                        "Cancel",
+                        key=f"dup_del_no_{sid}_{op}",
+                        width="stretch",
+                    ):
+                        st.session_state.pop(d_pending, None)
+                        st.rerun()
+
     for skill_list in sorted(op_lists, key=lambda s: (s == "", s.lower())):
         sublist = op_lists[skill_list]
         if skill_list:
@@ -2058,8 +2287,14 @@ def _render_operant_body(
                     "Planned targets aren't probed yet and don't count toward "
                     "current totals or the cumulative mastered chart."
                 )
+                st.caption(
+                    "**Introduce** starts teaching (goes to In Acquisition). "
+                    "**Probed out** marks a skill the student already demonstrates — "
+                    "it jumps straight to Mastered and counts toward the repertoire "
+                    "total, tagged (PO), without teaching probes."
+                )
                 for pt in sorted(planned_targets, key=lambda t: t["description"].lower()):
-                    pcols = st.columns([6, 2])
+                    pcols = st.columns([5, 2, 2])
                     with pcols[0]:
                         st.write(f"• {pt['description']}")
                     with pcols[1]:
@@ -2074,6 +2309,28 @@ def _render_operant_body(
                                     x["status"] = "In Acquisition"
                                     break
                             save_targets(targets)
+                            st.rerun()
+                    with pcols[2]:
+                        if st.button(
+                            "Probed out",
+                            key=f"probeout_{pt['id']}",
+                            width="stretch",
+                            help=(
+                                "Student already has this skill. Marks it Mastered "
+                                "via probe-out with today's date — no teaching probes."
+                            ),
+                        ):
+                            today_iso = date.today().isoformat()
+                            for x in targets:
+                                if x["id"] == pt["id"]:
+                                    x["status"] = "Mastered"
+                                    x["mastered_date"] = today_iso
+                                    x["mastered_via"] = "PO"
+                                    x["mastered_probe_count"] = 0
+                                    break
+                            save_targets(targets)
+                            log_mastery_event(sid, pt["id"], "mastered", today_iso)
+                            st.toast(f"Probed out: {pt['description']}")
                             st.rerun()
 
         # ── Curriculum from bank (per-list recommendations) ────────────────
@@ -2530,7 +2787,14 @@ def _render_operant_body(
             "Target": t["description"],
             "Probes to mastery": t.get("mastered_probe_count", 0) or 0,
         } for t in mastered_in_op])
-        st.caption(f"**{len(mastered_in_op)}** mastered target(s) in {op}.")
+        n_po_op = sum(1 for t in mastered_in_op if t.get("mastered_via") == "PO")
+        po_caption = (
+            f" — {len(mastered_in_op) - n_po_op} taught · {n_po_op} probed out"
+            if n_po_op else ""
+        )
+        st.caption(
+            f"**{len(mastered_in_op)}** mastered target(s) in {op}{po_caption}."
+        )
         m_editor_key = f"mastered_select_{op}"
         m_edited = st.data_editor(
             df_m,
@@ -2771,6 +3035,10 @@ def page_targets():
             op_targets = [t for sublist in grouped[op].values() for t in sublist]
             n_active = sum(1 for t in op_targets if t["status"] == "In Acquisition")
             n_mastered = sum(1 for t in op_targets if t["status"] == "Mastered")
+            n_po = sum(
+                1 for t in op_targets
+                if t["status"] == "Mastered" and t.get("mastered_via") == "PO"
+            )
             n_planned = sum(1 for t in op_targets if t["status"] == "Planned")
             n_lists = sum(1 for k in grouped[op] if k)
             with cols[i % n_cols]:
@@ -2779,7 +3047,8 @@ def page_targets():
                     st.markdown(f"### {op}")
                     list_line = f"{n_lists} list{'s' if n_lists != 1 else ''} · " if n_lists else ""
                     planned_line = f" · {n_planned} planned" if n_planned else ""
-                    st.caption(f"{list_line}{n_active} in acquisition · {n_mastered} mastered{planned_line}")
+                    po_line = f" ({n_po} probed out)" if n_po else ""
+                    st.caption(f"{list_line}{n_active} in acquisition · {n_mastered} mastered{po_line}{planned_line}")
                     avg_d = avg_days_to_mastery(op_targets, probes)
                     if avg_d is not None:
                         st.caption(
@@ -2930,7 +3199,48 @@ def page_operant_detail():
     if add_msg:
         st.success(add_msg)
 
+    # ── Per-operant PDF report ───────────────────────────────────────────────
+    op_pdf_key = f"op_pdf_{sid}_{op}"
+    op_pdf_bytes = st.session_state.get(op_pdf_key)
+    if op_pdf_bytes is None:
+        gen_col, _ = st.columns([1, 3])
+        with gen_col:
+            if st.button(
+                f"📄 Generate {op} report (PDF)",
+                key=f"op_pdf_gen_{op}", width="stretch",
+            ):
+                with st.spinner("Generating PDF — this can take a few seconds…"):
+                    st.session_state[op_pdf_key] = build_operant_report_pdf(
+                        sid, op, students, targets, probes,
+                    )
+                st.rerun()
+    else:
+        dl_col, regen_col = st.columns([3, 1])
+        with dl_col:
+            st.download_button(
+                f"📄 Download {op} report (PDF)",
+                data=op_pdf_bytes,
+                file_name=(
+                    f"{op.replace(' ', '_')}_report_"
+                    f"{student_name(students, sid).replace(' ', '_')}_"
+                    f"{date.today().isoformat()}.pdf"
+                ),
+                mime="application/pdf",
+                key=f"op_pdf_dl_{op}", width="stretch",
+            )
+        with regen_col:
+            if st.button(
+                "Regenerate", key=f"op_pdf_regen_{op}", width="stretch",
+                help="Rebuild after data changes.",
+            ):
+                st.session_state.pop(op_pdf_key, None)
+                st.rerun()
+
     _render_operant_body(sid, op, grouped[op], targets, probes)
+
+    st.divider()
+    st.subheader(f"📈 Cumulative mastered — {op}")
+    _render_cumulative_mastery(sid, operant=op)
 
 
 
@@ -3201,7 +3511,7 @@ class _ReportPDF(FPDF):
         self.cell(
             avail_w / 2, 5,
             _pdf_safe(getattr(self, "_running_header", "")),
-            ln=True, align="R",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R",
         )
         # Hairline rule under the masthead.
         self.set_draw_color(214, 211, 209)
@@ -3249,7 +3559,7 @@ def _pdf_init(running_header: str) -> _ReportPDF:
 def _pdf_h1(pdf: FPDF, text: str):
     pdf.set_text_color(28, 25, 23)
     pdf.set_font("Helvetica", "B", 22)
-    pdf.cell(0, 11, _pdf_safe(text), ln=True)
+    pdf.cell(0, 11, _pdf_safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(0.5)
 
 
@@ -3262,7 +3572,7 @@ def _pdf_h2(pdf: FPDF, text: str):
     pdf.set_x(pdf.l_margin + 4.2)
     pdf.set_text_color(28, 25, 23)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, _pdf_safe(text), ln=True)
+    pdf.cell(0, 7, _pdf_safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_draw_color(229, 229, 226)
     pdf.set_line_width(0.3)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
@@ -3283,7 +3593,7 @@ def _pdf_kv_row(pdf: FPDF, label: str, value: str):
     pdf.cell(54, 5.6, _pdf_safe(label))
     pdf.set_font("Helvetica", "B", 9.5)
     pdf.set_text_color(28, 25, 23)
-    pdf.cell(0, 5.6, _pdf_safe(value), ln=True)
+    pdf.cell(0, 5.6, _pdf_safe(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
 def _pdf_table(pdf: FPDF, headers: list[str], rows: list[list[str]],
@@ -3291,7 +3601,7 @@ def _pdf_table(pdf: FPDF, headers: list[str], rows: list[list[str]],
     if not rows:
         pdf.set_font("Helvetica", "I", 9)
         pdf.set_text_color(150, 145, 140)
-        pdf.cell(0, 6, "(none)", ln=True)
+        pdf.cell(0, 6, "(none)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_text_color(28, 25, 23)
         pdf.ln(1)
         return
@@ -3391,7 +3701,7 @@ def _pdf_legend_box(
 
 
 def _pdf_bytes(pdf: FPDF) -> bytes:
-    out = pdf.output(dest="S")
+    out = pdf.output()
     if isinstance(out, str):
         return out.encode("latin-1")
     return bytes(out)
@@ -3509,6 +3819,15 @@ def build_progress_report_pdf(
             widths=[3, 1],
         )
 
+    cum_png = _cumulative_mastery_png(sid)
+    if cum_png:
+        _pdf_h2(pdf, "Cumulative mastered targets (by operant)")
+        _pdf_caption(
+            pdf,
+            "Running total at the end of each day; probed-out targets included.",
+        )
+        _pdf_embed_png(pdf, cum_png, max_height_mm=95)
+
     if s_mastered:
         _pdf_h2(pdf, "Mastery log")
         rows = []
@@ -3616,6 +3935,130 @@ def build_progress_report_pdf(
                 rows,
                 widths=[1, 1.6, 2.2],
             )
+
+    return _pdf_bytes(pdf)
+
+
+def build_operant_report_pdf(
+    sid: str, op: str, students: list[dict],
+    targets: list[dict], probes: list[dict],
+) -> bytes:
+    """A report scoped to a single verbal operant for one student."""
+    name = student_name(students, sid)
+    pdf = _pdf_init(f"{op} Report · {name}")
+    _pdf_h1(pdf, op)
+    _pdf_caption(
+        pdf,
+        f"{name}  ·  Verbal operant report  ·  "
+        f"generated {date.today().isoformat()}",
+    )
+
+    op_targets = [
+        t for t in targets if t["student_id"] == sid and t["domain"] == op
+    ]
+    mastered = [t for t in op_targets if t["status"] == "Mastered"]
+    active = [t for t in op_targets if t["status"] == "In Acquisition"]
+    planned = [t for t in op_targets if t["status"] == "Planned"]
+    n_po = sum(1 for t in mastered if t.get("mastered_via") == "PO")
+
+    _pdf_h2(pdf, "Summary")
+    mastered_val = str(len(mastered))
+    if n_po:
+        mastered_val += f"   ({len(mastered) - n_po} taught, {n_po} probed out)"
+    _pdf_kv_row(pdf, "Mastered targets:", mastered_val)
+    _pdf_kv_row(pdf, "In acquisition:", str(len(active)))
+    _pdf_kv_row(pdf, "Planned:", str(len(planned)))
+    avg_d = avg_days_to_mastery(op_targets, probes)
+    if avg_d is not None:
+        _pdf_kv_row(pdf, "Avg days to mastery:", f"{avg_d:.0f}")
+    pdf.ln(3)
+
+    if not op_targets:
+        _pdf_caption(pdf, f"No {op} targets for this student yet.")
+        return _pdf_bytes(pdf)
+
+    # Cumulative chart scoped to this operant.
+    cum_png = _cumulative_mastery_png(sid, operant=op)
+    if cum_png:
+        _pdf_h2(pdf, "Cumulative mastered targets")
+        _pdf_caption(
+            pdf,
+            "Running total at the end of each day; probed-out targets included.",
+        )
+        _pdf_embed_png(pdf, cum_png, max_height_mm=90)
+
+    # Per-skill-list breakdown.
+    by_list: dict[str, dict[str, int]] = {}
+    for t in op_targets:
+        key = (t.get("skill_list", "") or "—")
+        d = by_list.setdefault(key, {"Mastered": 0, "In acq.": 0, "Planned": 0})
+        if t["status"] == "Mastered":
+            d["Mastered"] += 1
+        elif t["status"] == "In Acquisition":
+            d["In acq."] += 1
+        elif t["status"] == "Planned":
+            d["Planned"] += 1
+    if len(by_list) > 1 or "—" not in by_list:
+        _pdf_h2(pdf, "By skill list")
+        _pdf_table(
+            pdf,
+            ["Skill list", "Mastered", "In acq.", "Planned"],
+            [
+                [lst, str(d["Mastered"]), str(d["In acq."]), str(d["Planned"])]
+                for lst, d in sorted(by_list.items())
+            ],
+            widths=[3, 1, 1, 1],
+        )
+
+    if active:
+        _pdf_h2(pdf, "Current targets (in acquisition)")
+        _pdf_table(
+            pdf,
+            ["List", "Target", "Date introduced", "Probes"],
+            [
+                [
+                    t.get("skill_list", "") or "-",
+                    t["description"],
+                    _fmt_date(first_data_date(t["id"], probes)) or "-",
+                    str(len([p for p in probes if p["target_id"] == t["id"]])),
+                ]
+                for t in sorted(active, key=lambda t: t["description"].lower())
+            ],
+            widths=[1.3, 3.2, 1.2, 0.7],
+        )
+
+    if mastered:
+        _pdf_h2(pdf, "Mastery log")
+        rows = []
+        for t in sorted(
+            mastered, key=lambda t: (t.get("mastered_date") or ""), reverse=True
+        ):
+            tp = [p for p in probes if p["target_id"] == t["id"]]
+            rows.append([
+                _fmt_date(first_data_date(t["id"], probes)) or "-",
+                mastered_date_label(t) or "-",
+                t.get("skill_list", "") or "-",
+                t["description"],
+                str(t.get("mastered_probe_count", len(tp)) or len(tp)),
+            ])
+        _pdf_table(
+            pdf,
+            ["Date Introduced", "Date Mastered", "List", "Target", "Probes"],
+            rows,
+            widths=[1.2, 1.2, 1.2, 3.2, 0.7],
+        )
+
+    if planned:
+        _pdf_h2(pdf, "Planned targets")
+        _pdf_table(
+            pdf,
+            ["List", "Target"],
+            [
+                [t.get("skill_list", "") or "-", t["description"]]
+                for t in sorted(planned, key=lambda t: t["description"].lower())
+            ],
+            widths=[1.5, 4],
+        )
 
     return _pdf_bytes(pdf)
 
@@ -3760,11 +4203,17 @@ def build_session_pdf(
     return _pdf_bytes(pdf)
 
 
-def _behavior_line_chart_png(b: dict, records: list[dict]) -> bytes | None:
+def _behavior_line_chart_png(
+    b: dict, records: list[dict],
+    show_trend: bool = False, show_level: bool = False,
+    window_days: int | None = None, period: str = "Per session",
+) -> bytes | None:
     """Render the behavior's line-graph trend to a PNG byte string.
 
     Tries Plotly+kaleido first; falls back to matplotlib so the chart still
     embeds when kaleido is unavailable or times out (~20 s in headless mode).
+    Pass ``window_days`` to restrict the chart to the most recent N days, and
+    ``period`` (Daily/Weekly/Monthly) to aggregate into a bar chart.
     """
     mt = MEASUREMENT_TYPES.get(b["measurement"], MEASUREMENT_TYPES["frequency"])
     b_rows = sorted(
@@ -3777,16 +4226,39 @@ def _behavior_line_chart_png(b: dict, records: list[dict]) -> bytes | None:
         "Date": pd.to_datetime(r["date"]),
         "Value": _record_display_value(b, r),
     } for r in b_rows]).sort_values("Date")
+    df_b = _aggregate_period(
+        _filter_window(df_b, window_days), b["measurement"], period,
+    )
+    if df_b.empty:
+        return None
+    is_bar = period != "Per session"
     bphases = phases_for_behavior(b["student_id"], b["id"])
     xr = _xrange_with_phases(df_b["Date"], bphases)
 
-    fig = px.line(df_b, x="Date", y="Value", markers=True)
-    fig.update_traces(
-        line=dict(color="#ea580c"),
-        marker=dict(size=9, color="#ea580c", line=dict(width=1.5, color="white")),
-    )
+    if is_bar:
+        fig = px.bar(df_b, x="Date", y="Value")
+        fig.update_traces(
+            marker_color="#ea580c", marker_line_width=0,
+            text=df_b["Value"], texttemplate="%{y:.0f}",
+            textposition="outside", cliponaxis=False,
+            textfont=dict(size=12, color="#1c1917"),
+        )
+    else:
+        fig = px.line(df_b, x="Date", y="Value", markers=True)
+        fig.update_traces(
+            mode="lines+markers+text",
+            line=dict(color="#ea580c"),
+            marker=dict(size=9, color="#ea580c",
+                        line=dict(width=1.5, color="white")),
+            text=df_b["Value"], texttemplate="%{y:.0f}",
+            textposition="top center",
+            textfont=dict(size=11, color="#1c1917"),
+        )
     fig.update_yaxes(
-        title=dict(text=mt["axis"], standoff=18, font=dict(size=14)),
+        title=dict(
+            text=_graph_y_title(mt, b["measurement"], period),
+            standoff=18, font=dict(size=14),
+        ),
         rangemode="tozero",
         gridcolor="#f0eeec", zeroline=False,
         tickfont=dict(size=12),
@@ -3794,10 +4266,31 @@ def _behavior_line_chart_png(b: dict, records: list[dict]) -> bytes | None:
     fig.update_xaxes(
         title=None, gridcolor="#f0eeec", zeroline=False,
         tickangle=-35, tickfont=dict(size=11),
+        showline=True, linecolor="#d6d3d1", linewidth=1,
     )
+    _apply_period_xticks(fig, period)
     if xr:
         fig.update_xaxes(range=xr)
     _apply_phase_lines(fig, bphases)
+    if show_level:
+        level = float(df_b["Value"].mean())
+        fig.add_hline(
+            y=level,
+            line=dict(color="#0ea5e9", width=2, dash="dot"),
+            annotation_text=f"Level: {round(level)}",
+            annotation_position="top left",
+            annotation_font_color="#0369a1",
+        )
+    if show_trend:
+        fit = _best_fit_line(df_b["Date"], df_b["Value"])
+        if fit:
+            x0, x1, y0, y1, _slope = fit
+            fig.add_scatter(
+                x=[x0, x1], y=[y0, y1], mode="lines",
+                line=dict(color="#1c1917", width=2, dash="dash"),
+                name="Trend", hoverinfo="skip", showlegend=False,
+            )
+    _integer_yaxis(fig, df_b["Value"])
     fig.update_layout(
         margin=dict(l=90, r=30, t=40, b=90),
         height=520,
@@ -3810,11 +4303,16 @@ def _behavior_line_chart_png(b: dict, records: list[dict]) -> bytes | None:
     png = _safe_to_image(fig, scale=2)
     if png:
         return png
-    return _behavior_line_chart_png_mpl(b, df_b, bphases, xr)
+    return _behavior_line_chart_png_mpl(
+        b, df_b, bphases, xr, show_trend=show_trend, show_level=show_level,
+        period=period,
+    )
 
 
 def _behavior_line_chart_png_mpl(
     b: dict, df_b: "pd.DataFrame", phases: list[dict], xr,
+    show_trend: bool = False, show_level: bool = False,
+    period: str = "Per session",
 ) -> bytes | None:
     """Matplotlib fallback for the behavior line chart (used when kaleido fails)."""
     try:
@@ -3828,14 +4326,49 @@ def _behavior_line_chart_png_mpl(
 
     mt = MEASUREMENT_TYPES.get(b["measurement"], MEASUREMENT_TYPES["frequency"])
     fig, ax = plt.subplots(figsize=(12, 5.2), dpi=160)
-    ax.plot(
-        df_b["Date"], df_b["Value"],
-        color="#ea580c", linewidth=2,
-        marker="o", markersize=7,
-        markerfacecolor="#ea580c", markeredgecolor="white", markeredgewidth=1.4,
-    )
-    ax.set_ylabel(mt["axis"], fontsize=12, labelpad=12)
+    if period != "Per session":
+        bar_w = {
+            "Daily": 0.8, "Weekly": 5, "Monthly": 25, "Yearly": 300,
+        }.get(period, 0.8)
+        bars = ax.bar(df_b["Date"], df_b["Value"], width=bar_w, color="#ea580c")
+        ax.bar_label(bars, fmt="%.0f", padding=3, fontsize=10, color="#1c1917")
+    else:
+        ax.plot(
+            df_b["Date"], df_b["Value"],
+            color="#ea580c", linewidth=2,
+            marker="o", markersize=7,
+            markerfacecolor="#ea580c", markeredgecolor="white",
+            markeredgewidth=1.4,
+        )
+        for _x, _y in zip(df_b["Date"], df_b["Value"]):
+            ax.annotate(
+                f"{_y:.0f}", xy=(_x, _y), xytext=(0, 6),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=9, color="#1c1917",
+            )
+    ax.set_ylabel(_graph_y_title(mt, b["measurement"], period),
+                  fontsize=12, labelpad=12)
     ax.set_xlabel("")
+    if show_level and len(df_b):
+        level = float(df_b["Value"].mean())
+        ax.axhline(
+            y=level, color="#0ea5e9", linewidth=2, linestyle=":",
+            label=f"Level: {round(level)}",
+        )
+        ax.annotate(
+            f"Level: {round(level)}",
+            xy=(0.01, level), xycoords=("axes fraction", "data"),
+            xytext=(0, 3), textcoords="offset points",
+            ha="left", va="bottom", fontsize=9, color="#0369a1",
+        )
+    if show_trend:
+        fit = _best_fit_line(df_b["Date"], df_b["Value"])
+        if fit:
+            x0, x1, y0, y1, _slope = fit
+            ax.plot(
+                [x0, x1], [y0, y1],
+                color="#1c1917", linewidth=2, linestyle="--",
+            )
     y_lo, y_hi = ax.get_ylim()
     ax.set_ylim(0, max(y_hi, 1))
     if xr:
@@ -3868,8 +4401,15 @@ def _behavior_line_chart_png_mpl(
             ),
         )
 
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d/%y"))
+    if period == "Monthly":
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%Y"))
+    elif period == "Yearly":
+        ax.xaxis.set_major_locator(mdates.YearLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    else:
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d/%y"))
     for label in ax.get_xticklabels():
         label.set_rotation(-35)
         label.set_horizontalalignment("left")
@@ -3993,6 +4533,57 @@ def _pdf_embed_png(pdf: FPDF, png: bytes, max_height_mm: float = 95.0):
     pdf.ln(target_h + 3)
 
 
+def _pdf_chart_grid(
+    pdf: FPDF, items: list[tuple], ncols: int = 2,
+    gutter: float = 6.0, max_cell_h: float = 48.0,
+):
+    """Lay out (label, png) charts in an N-column grid with page-break handling.
+
+    Each cell shows a small bold label above its chart. Charts keep their
+    aspect ratio and are capped at ``max_cell_h`` mm tall.
+    """
+    if not items:
+        return
+    try:
+        from PIL import Image
+    except Exception:
+        Image = None
+
+    def _aspect(png: bytes) -> float:
+        if Image is None:
+            return 0.45
+        try:
+            with Image.open(io.BytesIO(png)) as im:
+                iw, ih = im.size
+            return (ih / iw) if iw else 0.45
+        except Exception:
+            return 0.45
+
+    avail_w = pdf.w - pdf.l_margin - pdf.r_margin
+    col_w = (avail_w - gutter * (ncols - 1)) / ncols
+    label_h = 5.0
+    for i in range(0, len(items), ncols):
+        row = items[i:i + ncols]
+        row_img_h = max(min(col_w * _aspect(png), max_cell_h) for _l, png in row)
+        row_h = label_h + row_img_h + 5
+        if pdf.get_y() + row_h > pdf.h - 18:
+            pdf.add_page()
+        y0 = pdf.get_y()
+        for j, (lbl, png) in enumerate(row):
+            x = pdf.l_margin + j * (col_w + gutter)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(120, 113, 108)
+            pdf.text(x, y0 + 3.5, _pdf_safe(lbl))
+            asp = _aspect(png)
+            img_h = min(col_w * asp, max_cell_h)
+            img_w = (img_h / asp) if asp else col_w
+            if img_w > col_w:
+                img_w, img_h = col_w, col_w * asp
+            pdf.image(io.BytesIO(png), x=x, y=y0 + label_h, w=img_w, h=img_h)
+        pdf.set_text_color(28, 25, 23)
+        pdf.set_xy(pdf.l_margin, y0 + row_h)
+
+
 def build_behavior_pdf(
     b: dict, sid: str, students: list[dict], records: list[dict],
 ) -> bytes:
@@ -4096,7 +4687,7 @@ def build_behavior_pdf(
         pdf.ln(2)
         if analysis["phases"]:
             pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(0, 6, _pdf_safe("Across program phases"), ln=True)
+            pdf.cell(0, 6, _pdf_safe("Across program phases"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(1)
             phase_rows = [
                 [
@@ -4119,15 +4710,44 @@ def build_behavior_pdf(
                 widths=[1.5, 1.6, 0.6, 1.0, 1.4, 1.4],
             )
 
-    line_png = _behavior_line_chart_png(b, records)
-    if line_png:
-        _pdf_h2(pdf, "Line graph")
-        _pdf_embed_png(pdf, line_png, max_height_mm=85)
+    show_t = bool(st.session_state.get(f"bx_trend_{b['id']}"))
+    show_l = bool(st.session_state.get(f"bx_level_{b['id']}"))
+    # 1) Total line graph — every session over all time (default selection).
+    if st.session_state.get(f"bx_pdf_line_{b['id']}", True):
+        line_png = _behavior_line_chart_png(
+            b, records, show_trend=show_t, show_level=show_l, period="Per session",
+        )
+        if line_png:
+            _pdf_h2(pdf, "Line graph — all sessions")
+            _pdf_embed_png(pdf, line_png, max_height_mm=85)
+    # 2) Aggregated bar graphs — each selectable (Daily off by default).
+    reducer_word = (
+        "totals" if b["measurement"] in _GRAPH_SUM_MEASUREMENTS else "averages"
+    )
+    bar_specs = [
+        ("Daily", f"bx_pdf_daily_{b['id']}", False),
+        ("Weekly", f"bx_pdf_weekly_{b['id']}", True),
+        ("Monthly", f"bx_pdf_monthly_{b['id']}", True),
+        ("Yearly", f"bx_pdf_yearly_{b['id']}", True),
+    ]
+    bar_charts = []
+    for period_name, skey, default_on in bar_specs:
+        if not st.session_state.get(skey, default_on):
+            continue
+        png = _behavior_line_chart_png(
+            b, records, show_trend=show_t, show_level=show_l, period=period_name,
+        )
+        if png:
+            bar_charts.append((f"{period_name} {reducer_word}", png))
+    if bar_charts:
+        _pdf_h2(pdf, "Bar graphs")
+        _pdf_chart_grid(pdf, bar_charts, ncols=2)
 
-    scc_png = _behavior_scc_chart_png(b, records)
-    if scc_png:
-        _pdf_h2(pdf, "Standard Celeration Chart")
-        _pdf_embed_png(pdf, scc_png, max_height_mm=115)
+    if st.session_state.get(f"bx_pdf_scc_{b['id']}", True):
+        scc_png = _behavior_scc_chart_png(b, records)
+        if scc_png:
+            _pdf_h2(pdf, "Standard Celeration Chart")
+            _pdf_embed_png(pdf, scc_png, max_height_mm=115)
 
     _pdf_h2(pdf, "Session log")
     rows = []
@@ -5003,18 +5623,67 @@ def _variability_label(key: str) -> str:
     return _VARIABILITY_LABELS.get(key, "—")
 
 
+def _qty_noun(unit: str, singular: bool) -> str:
+    """Human counting noun for a measurement unit.
+
+    'count' is a measurement *type*, not a thing you can have "2 of" — so
+    frequency behaviors read as instance(s). Other units (minutes, seconds,
+    per hour, 1–5) already read naturally and are returned unchanged.
+    """
+    if unit == "count":
+        return "instance" if singular else "instances"
+    return unit
+
+
+def _whole_avg(mean: float, unit: str) -> str:
+    """Decimal-free 'typical level' phrasing for a per-session average."""
+    if mean >= 0.95:
+        q = round(mean)
+        return f"{q} {_qty_noun(unit, q == 1)}"
+    if mean <= 0:
+        return f"0 {_qty_noun(unit, False)}"
+    return f"less than 1 {_qty_noun(unit, True)}"
+
+
+def _whole_avg_card(mean: float, unit: str) -> str:
+    """Compact decimal-free typical level for the metric card (uses '<1')."""
+    if mean >= 0.95:
+        q = round(mean)
+        return f"{q} {_qty_noun(unit, q == 1)}"
+    if mean <= 0:
+        return f"0 {_qty_noun(unit, False)}"
+    return f"<1 {_qty_noun(unit, True)}"
+
+
+def _whole_avg_short(mean: float) -> str:
+    """Bare decimal-free number for table cells (unit lives in the header)."""
+    if mean >= 0.95:
+        return str(round(mean))
+    if mean <= 0:
+        return "0"
+    return "<1"
+
+
+def _trend_rate_phrase(per_week: float, unit: str) -> str:
+    """Decimal-free description of the weekly trend rate."""
+    word = "down" if per_week < 0 else "up"
+    wk = abs(per_week)
+    if round(wk) >= 1:
+        q = round(wk)
+        return f"about {q} {_qty_noun(unit, q == 1)} {word}/week"
+    return f"less than 1 {_qty_noun(unit, True)} {word}/week"
+
+
 def _direction_subtitle(o: dict, mt: dict) -> str:
     if o["n"] < 2 or o["trend_desc"] == "stable":
-        return f"slope ≈ 0/wk"
-    change = abs(o["slope_per_week"])
-    word = "down" if o["slope_per_week"] < 0 else "up"
-    return f"about {change:.1f} {mt['unit']} {word}/week"
+        return "holding steady"
+    return _trend_rate_phrase(o["slope_per_week"], mt["unit"])
 
 
 def _variability_subtitle(o: dict) -> str:
     if o["n"] < 2:
         return "—"
-    return f"CV {o['cv']:.2f}  ·  range {o['range']:g}"
+    return f"range {o['min']:g}–{o['max']:g}"
 
 
 def _behavior_plain_summary(b: dict, mt: dict, o: dict) -> str:
@@ -5035,10 +5704,12 @@ def _behavior_plain_summary(b: dict, mt: dict, o: dict) -> str:
         "moderate": "with some day-to-day ups and downs",
         "high": "with quite a bit of variation between sessions",
     }.get(o["variability_desc"], "")
+    avg_phrase = _whole_avg(o["mean"], mt["unit"])
+    avg_lead = "averaging " + ("about " if o["mean"] >= 0.95 else "")
     parts = [
         f"Across **{o['n']}** sessions from {o['start_date']} to "
         f"{o['end_date']}, **{b['name']}** has been **{direction}**, "
-        f"averaging about **{o['mean']:.1f} {mt['unit']}** per session"
+        f"{avg_lead}**{avg_phrase}** per session"
     ]
     if consistency:
         parts.append(f", {consistency}")
@@ -5046,9 +5717,16 @@ def _behavior_plain_summary(b: dict, mt: dict, o: dict) -> str:
     if abs(o["slope_per_week"]) > 0.05 and o["trend_desc"] != "stable":
         wc = abs(o["slope_per_week"])
         word = "decreasing" if o["slope_per_week"] < 0 else "increasing"
-        parts.append(
-            f" That works out to about **{wc:.1f} {mt['unit']} {word} per week** on average."
-        )
+        if round(wc) >= 1:
+            parts.append(
+                f" That works out to about **{round(wc)} "
+                f"{_qty_noun(mt['unit'], round(wc) == 1)} "
+                f"{word} per week** on average."
+            )
+        else:
+            parts.append(
+                f" The change is gradual — **less than 1 {mt['unit']} per week**."
+            )
     return "".join(parts)
 
 
@@ -5195,6 +5873,188 @@ def behavior_value_display(behavior: dict, record: dict) -> str:
     if measurement == "magnitude":
         return f"{int(val)} of 5"
     return f"{int(val)} {mt['unit']}"
+
+
+# ── Behavior-graph time filters ──────────────────────────────────────────────
+# Window options map a label to a look-back length in days (None = all history).
+GRAPH_WINDOW_OPTIONS: dict[str, int | None] = {
+    "All time": None,
+    "Last 30 days": 30,
+    "Last 3 months": 90,
+    "Last 6 months": 182,
+    "Last year": 365,
+}
+GRAPH_PERIOD_OPTIONS = ["Per session", "Daily", "Weekly", "Monthly"]
+# Measurements that are additive over a period (total count / total minutes).
+# Everything else (rate, latency, magnitude) is averaged instead.
+_GRAPH_SUM_MEASUREMENTS = {"frequency", "duration"}
+
+
+_GRAPH_CUSTOM_LABEL = "Custom…"
+
+
+def _behavior_graph_controls(
+    key_suffix: str, *, allow_period: bool = True, data_dates=None,
+):
+    """Render time-window (and optional aggregation) selectors.
+
+    Returns ``(window_days, period, custom_range)``: ``window_days`` is an int
+    or None (all time), ``period`` is one of ``GRAPH_PERIOD_OPTIONS``, and
+    ``custom_range`` is None or a ``(start_date, end_date)`` tuple when the
+    user picked **Custom…**.
+    """
+    cols = st.columns(2 if allow_period else 1)
+    with cols[0]:
+        window_label = st.selectbox(
+            "Time window",
+            list(GRAPH_WINDOW_OPTIONS) + [_GRAPH_CUSTOM_LABEL],
+            index=0,
+            key=f"bx_window_{key_suffix}",
+        )
+    period = "Per session"
+    if allow_period:
+        with cols[1]:
+            period = st.selectbox(
+                "Aggregate",
+                GRAPH_PERIOD_OPTIONS,
+                index=0,
+                key=f"bx_period_{key_suffix}",
+                help="Combine sessions into one point per day, week, or month.",
+            )
+
+    custom_range = None
+    window_days = None
+    if window_label == _GRAPH_CUSTOM_LABEL:
+        if data_dates is not None and len(data_dates):
+            _dts = pd.to_datetime(list(data_dates))
+            d_lo, d_hi = _dts.min().date(), _dts.max().date()
+        else:
+            d_hi = date.today()
+            d_lo = (pd.Timestamp(d_hi) - pd.Timedelta(days=30)).date()
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            c_start = st.date_input(
+                "From", value=d_lo, key=f"bx_cfrom_{key_suffix}",
+            )
+        with cc2:
+            c_end = st.date_input(
+                "To", value=d_hi, key=f"bx_cto_{key_suffix}",
+            )
+        if c_start and c_end:
+            if c_start > c_end:
+                st.warning("'From' is after 'To' — showing the range anyway.")
+                c_start, c_end = c_end, c_start
+            custom_range = (c_start, c_end)
+    else:
+        window_days = GRAPH_WINDOW_OPTIONS[window_label]
+    return window_days, period, custom_range
+
+
+def _filter_window(df: pd.DataFrame, window_days: int | None) -> pd.DataFrame:
+    """Keep rows whose ``Date`` falls within ``window_days`` of today."""
+    if window_days is None or df.empty:
+        return df
+    cutoff = pd.Timestamp(date.today()) - pd.Timedelta(days=window_days)
+    return df[df["Date"] >= cutoff]
+
+
+def _apply_time_filter(df: pd.DataFrame, window_days, custom_range) -> pd.DataFrame:
+    """Filter ``Date``/``Value`` rows by a custom range, else by ``window_days``."""
+    if custom_range is not None and not df.empty:
+        start, end = pd.Timestamp(custom_range[0]), pd.Timestamp(custom_range[1])
+        return df[(df["Date"] >= start) & (df["Date"] <= end)]
+    return _filter_window(df, window_days)
+
+
+def _aggregate_period(
+    df: pd.DataFrame, measurement: str, period: str,
+) -> pd.DataFrame:
+    """Bucket ``Date``/``Value`` rows by period, summing or averaging Value.
+
+    Frequency and duration sum (additive totals); all other measurements are
+    averaged. Empty buckets are dropped. ``Per session`` returns df unchanged.
+    """
+    if period == "Per session" or df.empty:
+        return df
+    reducer = "sum" if measurement in _GRAPH_SUM_MEASUREMENTS else "mean"
+    # Group on the period each record falls in — only periods that actually have
+    # data become points (no zero-filled empty days/weeks/months).
+    if period == "Daily":
+        keys = df["Date"].dt.normalize()
+    elif period == "Weekly":
+        keys = df["Date"].dt.to_period("W").dt.start_time
+    elif period == "Yearly":
+        keys = df["Date"].dt.to_period("Y").dt.start_time
+    else:  # Monthly
+        keys = df["Date"].dt.to_period("M").dt.start_time
+    grouped = df.groupby(keys)["Value"].agg(reducer).reset_index()
+    grouped.columns = ["Date", "Value"]
+    return grouped.sort_values("Date")
+
+
+def _graph_y_title(mt: dict, measurement: str, period: str) -> str:
+    """Y-axis title reflecting aggregation, e.g. 'Count — monthly total'."""
+    if period == "Per session":
+        return mt["axis"]
+    base = mt["axis"].replace(" per session", "")
+    adj = {
+        "Daily": "daily", "Weekly": "weekly",
+        "Monthly": "monthly", "Yearly": "yearly",
+    }.get(period, period.lower())
+    reducer = "total" if measurement in _GRAPH_SUM_MEASUREMENTS else "average"
+    return f"{base} — {adj} {reducer}"
+
+
+def _apply_period_xticks(fig, period: str) -> None:
+    """Format the date axis to match the aggregation period.
+
+    Monthly bars show their x labels as ``MM/YYYY`` with one tick per month.
+    """
+    if period == "Monthly":
+        fig.update_xaxes(tickformat="%m/%Y", dtick="M1")
+    elif period == "Yearly":
+        fig.update_xaxes(tickformat="%Y", dtick="M12")
+
+
+def _integer_yaxis(fig, values) -> None:
+    """Force whole-number y-axis ticks — never show decimals on the chart.
+
+    Data points are left untouched (they fall between ticks as needed); only the
+    tick labels/step are constrained to nice round integers (1, 2, 5, 10, …).
+    """
+    vmax = 1.0
+    try:
+        vmax = max((float(v) for v in values), default=1.0)
+    except (TypeError, ValueError):
+        vmax = 1.0
+    vmax = max(vmax, 1.0)
+    raw = max(vmax / 5.0, 1.0)  # aim for ~5 ticks
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next((m * mag for m in (1, 2, 5, 10) if m * mag >= raw), 10 * mag)
+    dtick = max(1, int(round(step)))
+    fig.update_yaxes(tickformat="d", tickmode="linear", tick0=0, dtick=dtick)
+
+
+def _best_fit_line(dates, values):
+    """Least-squares endpoints for a best-fit line over (date, value) points.
+
+    Returns ``(x0, x1, y0, y1)`` spanning the date range plus the slope, or
+    None when a line can't be fit (fewer than 2 points on distinct dates).
+    """
+    x = [(d - dates.min()).days for d in dates]
+    y = [float(v) for v in values]
+    n = len(x)
+    if n < 2 or len(set(x)) < 2:
+        return None
+    x_mean = sum(x) / n
+    y_mean = sum(y) / n
+    den = sum((xi - x_mean) ** 2 for xi in x)
+    if den == 0:
+        return None
+    slope = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y)) / den
+    intercept = y_mean - slope * x_mean
+    x_max = max(x)
+    return dates.min(), dates.max(), intercept, intercept + slope * x_max, slope
 
 
 def page_behaviors():
@@ -5591,6 +6451,9 @@ def page_behaviors():
             "Each behavior on its own line. Y-axis shows raw values — units "
             "may differ across behaviors (see legend)."
         )
+        window_days, period, agg_custom = _behavior_graph_controls(
+            "agg", data_dates=[r["date"] for r in student_records],
+        )
         b_lookup = {b["id"]: b for b in student_behaviors}
         agg_rows = []
         for r in student_records:
@@ -5604,18 +6467,51 @@ def page_behaviors():
                 "Date": pd.to_datetime(r["date"]),
                 "Value": _record_display_value(b, r),
                 "Behavior": f"{b['name']} ({mt['unit']})",
+                "measurement": b["measurement"],
             })
-        df_agg = pd.DataFrame(agg_rows).sort_values("Date")
-        fig = px.line(df_agg, x="Date", y="Value", color="Behavior", markers=True)
-        fig.update_traces(
-            marker=dict(size=8, line=dict(width=1.5, color="white")),
-            hovertemplate="<b>%{fullData.name}</b><br>%{x|%b %-d, %Y}: %{y}<extra></extra>",
+        df_agg = _apply_time_filter(
+            pd.DataFrame(agg_rows), window_days, agg_custom,
         )
+        if df_agg.empty:
+            st.info("No records in the selected time window.")
+            return
+        if period != "Per session":
+            parts = []
+            for (beh, meas), grp in df_agg.groupby(["Behavior", "measurement"]):
+                gg = _aggregate_period(grp[["Date", "Value"]], meas, period)
+                gg["Behavior"] = beh
+                parts.append(gg)
+            df_agg = pd.concat(parts, ignore_index=True)
+        df_agg = df_agg.sort_values("Date")
+        if period == "Per session":
+            fig = px.line(df_agg, x="Date", y="Value", color="Behavior", markers=True)
+            fig.update_traces(
+                mode="lines+markers+text",
+                marker=dict(size=8, line=dict(width=1.5, color="white")),
+                texttemplate="%{y:.0f}", textposition="top center",
+                textfont=dict(size=10),
+                hovertemplate="<b>%{fullData.name}</b><br>"
+                "%{x|%b %-d, %Y}: %{y:.0f}<extra></extra>",
+            )
+        else:
+            fig = px.bar(df_agg, x="Date", y="Value", color="Behavior")
+            fig.update_layout(barmode="group")
+            fig.update_traces(
+                marker_line_width=0,
+                texttemplate="%{y:.0f}", textposition="outside",
+                cliponaxis=False, textfont=dict(size=10),
+                hovertemplate="<b>%{fullData.name}</b><br>"
+                "%{x|%b %-d, %Y}: %{y:.0f}<extra></extra>",
+            )
         fig.update_yaxes(
             title=None, rangemode="tozero",
             gridcolor="#f0eeec", zeroline=False,
         )
-        fig.update_xaxes(title=None, gridcolor="#f0eeec", zeroline=False)
+        _integer_yaxis(fig, df_agg["Value"])
+        fig.update_xaxes(
+            title=None, gridcolor="#f0eeec", zeroline=False,
+            showline=True, linecolor="#d6d3d1", linewidth=1,
+        )
         fig.update_layout(
             margin=dict(l=10, r=10, t=10, b=10),
             height=340,
@@ -5627,6 +6523,10 @@ def page_behaviors():
                       color="#1c1917"),
         )
         st.plotly_chart(fig, width="stretch", key="bx_agg_chart")
+
+    # ── Problem Behavior Summary (EFL) ──────────────────────────────────────
+    s = next((x for x in students if x["id"] == sid), {})
+    _efl_pb_summary_section(sid, s)
 
 
 def page_behavior_detail():
@@ -5668,6 +6568,24 @@ def page_behavior_detail():
         detail_parts.append(b["definition"])
     st.caption(" · ".join(detail_parts))
 
+    with st.expander("⚙️ PDF report options", expanded=False):
+        st.caption("Choose which graphs to include in the report.")
+        gc1, gc2 = st.columns(2)
+        gc1.checkbox(
+            "Line graph (all sessions)", value=True,
+            key=f"bx_pdf_line_{b['id']}",
+        )
+        gc2.checkbox(
+            "Standard Celeration Chart", value=True,
+            key=f"bx_pdf_scc_{b['id']}",
+        )
+        st.caption("Aggregated bar graphs:")
+        bc1, bc2, bc3, bc4 = st.columns(4)
+        bc1.checkbox("Daily", value=False, key=f"bx_pdf_daily_{b['id']}")
+        bc2.checkbox("Weekly", value=True, key=f"bx_pdf_weekly_{b['id']}")
+        bc3.checkbox("Monthly", value=True, key=f"bx_pdf_monthly_{b['id']}")
+        bc4.checkbox("Yearly", value=True, key=f"bx_pdf_yearly_{b['id']}")
+
     pdf_session_key = f"bx_pdf_{b['id']}"
     pdf_bytes = st.session_state.get(pdf_session_key)
     if pdf_bytes is None:
@@ -5706,6 +6624,83 @@ def page_behavior_detail():
                 help="Rebuild the PDF after adding or editing data.",
             ):
                 st.session_state.pop(pdf_session_key, None)
+                st.rerun()
+
+    # ── Interventions ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🧩 Interventions")
+    attached = b.get("interventions", [])
+    if attached:
+        for iv in sorted(
+            attached, key=lambda x: x.get("start_date", ""), reverse=True,
+        ):
+            ic = st.columns([6, 3, 1])
+            note_txt = f" — {iv['notes']}" if iv.get("notes") else ""
+            ic[0].markdown(
+                f"**{iv['name']}**  \n_{iv.get('category', '')}_{note_txt}"
+            )
+            phase_tag = " · 📌 phase line" if iv.get("phase_id") else ""
+            ic[1].caption(
+                f"Started {_fmt_date(iv.get('start_date', ''))}{phase_tag}"
+            )
+            if ic[2].button(
+                "✕", key=f"iv_detach_{b['id']}_{iv['id']}",
+                help="Remove this intervention (and its phase line, if any).",
+            ):
+                detach_intervention(b["id"], iv["id"])
+                st.toast("Removed intervention.")
+                st.rerun()
+    else:
+        st.caption("No interventions attached to this behavior yet.")
+
+    with st.expander("➕ Attach an intervention", expanded=not attached):
+        ivbank = load_intervention_bank()
+        if not ivbank:
+            st.caption(
+                "The Intervention Bank is empty — add some on the "
+                "**Intervention Bank** page."
+            )
+        else:
+            cats = sorted({x["category"] for x in ivbank})
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                pick_cat = st.selectbox(
+                    "Category", cats, key=f"iv_att_cat_{b['id']}",
+                )
+            with ac2:
+                cat_items = sorted(
+                    [x for x in ivbank if x["category"] == pick_cat],
+                    key=lambda x: x["name"].lower(),
+                )
+                pick_name = st.selectbox(
+                    "Intervention", [x["name"] for x in cat_items],
+                    key=f"iv_att_name_{b['id']}",
+                )
+            chosen = next(
+                (x for x in cat_items if x["name"] == pick_name), None
+            )
+            d1, d2 = st.columns(2)
+            with d1:
+                start = st.date_input(
+                    "Start date", value=date.today(),
+                    key=f"iv_att_date_{b['id']}",
+                )
+            with d2:
+                make_phase = st.checkbox(
+                    "Mark a phase line on the graph at the start date",
+                    value=True, key=f"iv_att_phase_{b['id']}",
+                )
+            notes = st.text_input(
+                "Notes (optional)", key=f"iv_att_notes_{b['id']}",
+            )
+            if st.button(
+                "Attach intervention", type="primary",
+                disabled=chosen is None, key=f"iv_att_btn_{b['id']}",
+            ):
+                attach_intervention(
+                    b["id"], sid, chosen, start.isoformat(), notes, make_phase,
+                )
+                st.toast(f"Attached: {chosen['name']}")
                 st.rerun()
 
     edit_key = f"bx_detail_editing_{b['id']}"
@@ -5885,12 +6880,12 @@ def page_behavior_detail():
             kc1, kc2, kc3 = st.columns(3)
             kc1.metric(
                 "On a typical day",
-                f"{o['mean']:.1f} {mt['unit']}",
+                _whole_avg_card(o["mean"], mt["unit"]),
                 f"Range: {o['min']:g}–{o['max']:g}",
                 delta_color="off",
             )
             kc2.metric(
-                "Direction",
+                "Trend",
                 _direction_label(o["trend_desc"]),
                 _direction_subtitle(o, mt),
                 delta_color="off",
@@ -5908,8 +6903,8 @@ def page_behavior_detail():
                         "Phase": p["label"],
                         "Time period": f"{p['start_date']} → {p['end_date']}",
                         "Sessions": p["n"],
-                        f"Typical day ({mt['unit']})": f"{p['mean']:.1f}",
-                        "Direction": _direction_label(p["trend_desc"]),
+                        f"Typical day ({_qty_noun(mt['unit'], False)})": _whole_avg_short(p["mean"]),
+                        "Trend": _direction_label(p["trend_desc"]),
                         "Consistency": _variability_label(p["variability_desc"]),
                     }
                     for p in analysis["phases"]
@@ -5991,56 +6986,241 @@ def page_behavior_detail():
         )
 
         st.divider()
-        st.subheader("Line graph")
-        df_b = pd.DataFrame([{
+        _cur_period = st.session_state.get(
+            f"bx_period_detail_{b['id']}", "Per session",
+        )
+        st.subheader("Bar graph" if _cur_period != "Per session" else "Line graph")
+        bx_window_days, bx_period, bx_custom = _behavior_graph_controls(
+            f"detail_{b['id']}", data_dates=[r["date"] for r in b_rows],
+        )
+        ov1, ov2 = st.columns(2)
+        show_trend = ov1.checkbox(
+            "📈 Trend line (line of best fit)",
+            key=f"bx_trend_{b['id']}",
+        )
+        show_level = ov2.checkbox(
+            "➖ Level line (average)",
+            key=f"bx_level_{b['id']}",
+        )
+        df_b_all = pd.DataFrame([{
             "Date": pd.to_datetime(r["date"]),
             "Value": _record_display_value(b, r),
         } for r in b_rows]).sort_values("Date")
-        fig = px.line(df_b, x="Date", y="Value", markers=True)
-        fig.update_traces(
-            line=dict(color="#ea580c"),
-            marker=dict(size=9, color="#ea580c",
-                        line=dict(width=1.5, color="white")),
-            hovertemplate="%{x|%b %-d, %Y}: %{y}<extra></extra>",
+        df_b = _aggregate_period(
+            _apply_time_filter(df_b_all, bx_window_days, bx_custom),
+            b["measurement"], bx_period,
         )
-        fig.update_yaxes(
-            title=mt["axis"], rangemode="tozero",
-            gridcolor="#f0eeec", zeroline=False,
-        )
-        fig.update_xaxes(title=None, gridcolor="#f0eeec", zeroline=False)
-        _line_xr = _xrange_with_phases(df_b["Date"], b_phases)
-        if _line_xr:
-            fig.update_xaxes(range=_line_xr)
-        _apply_phase_lines(fig, b_phases)
-        fig.update_layout(
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=300,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            showlegend=False,
-            hoverlabel=dict(bgcolor="white", bordercolor="#e7e5e4"),
-            font=dict(family="-apple-system, BlinkMacSystemFont, Inter, sans-serif",
-                      color="#1c1917"),
-        )
-        st.plotly_chart(fig, width="stretch", key=f"bx_detail_chart_{b['id']}")
-        latest_rec = max(b_rows, key=lambda r: r["date"])
-        st.caption(
-            f"{len(df_b)} session(s) · latest "
-            f"**{behavior_value_display(b, latest_rec)}** on "
-            f"{df_b['Date'].iloc[-1].strftime('%m/%d/%Y')}."
-        )
+        if df_b.empty:
+            st.info("No sessions in the selected time window.")
+        else:
+            if bx_period == "Per session":
+                fig = px.line(df_b, x="Date", y="Value", markers=True)
+                fig.update_traces(
+                    mode="lines+markers+text",
+                    line=dict(color="#ea580c"),
+                    marker=dict(size=9, color="#ea580c",
+                                line=dict(width=1.5, color="white")),
+                    text=df_b["Value"], texttemplate="%{y:.0f}",
+                    textposition="top center",
+                    textfont=dict(size=11, color="#1c1917"),
+                    hovertemplate="%{x|%b %-d, %Y}: %{y:.0f}<extra></extra>",
+                )
+            else:
+                fig = px.bar(df_b, x="Date", y="Value")
+                fig.update_traces(
+                    marker_color="#ea580c", marker_line_width=0,
+                    text=df_b["Value"], texttemplate="%{y:.0f}",
+                    textposition="outside", cliponaxis=False,
+                    textfont=dict(size=11, color="#1c1917"),
+                    hovertemplate="%{x|%b %-d, %Y}: %{y:.0f}<extra></extra>",
+                )
+            fig.update_yaxes(
+                title=_graph_y_title(mt, b["measurement"], bx_period),
+                rangemode="tozero",
+                gridcolor="#f0eeec", zeroline=False,
+            )
+            _integer_yaxis(fig, df_b["Value"])
+            fig.update_xaxes(
+                title=None, gridcolor="#f0eeec", zeroline=False,
+                showline=True, linecolor="#d6d3d1", linewidth=1,
+            )
+            _apply_period_xticks(fig, bx_period)
+            _line_xr = _xrange_with_phases(df_b["Date"], b_phases)
+            if _line_xr:
+                fig.update_xaxes(range=_line_xr)
+            _apply_phase_lines(fig, b_phases)
+            overlay_notes: list[str] = []
+            if show_level:
+                level = float(df_b["Value"].mean())
+                fig.add_hline(
+                    y=level,
+                    line=dict(color="#0ea5e9", width=2, dash="dot"),
+                    annotation_text=f"Level: {round(level)}",
+                    annotation_position="top left",
+                    annotation_font_color="#0369a1",
+                )
+                overlay_notes.append(
+                    f"**Level** (blue dotted) = average of about "
+                    f"**{round(level)} {_qty_noun(mt['unit'], round(level) == 1)}**"
+                )
+            if show_trend:
+                fit = _best_fit_line(df_b["Date"], df_b["Value"])
+                if fit:
+                    x0, x1, y0, y1, slope = fit
+                    fig.add_scatter(
+                        x=[x0, x1], y=[y0, y1], mode="lines",
+                        line=dict(color="#1c1917", width=2, dash="dash"),
+                        name="Trend", hoverinfo="skip", showlegend=False,
+                    )
+                    direction = (
+                        "downward" if slope < 0
+                        else "upward" if slope > 0 else "flat"
+                    )
+                    overlay_notes.append(
+                        f"**Trend** (dashed) = line of best fit, sloping "
+                        f"**{direction}**"
+                    )
+                else:
+                    overlay_notes.append(
+                        "**Trend** needs at least 2 sessions on different dates"
+                    )
+            fig.update_layout(
+                margin=dict(l=10, r=10, t=30, b=10),
+                height=300,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                showlegend=False,
+                hoverlabel=dict(bgcolor="white", bordercolor="#e7e5e4"),
+                font=dict(family="-apple-system, BlinkMacSystemFont, Inter, sans-serif",
+                          color="#1c1917"),
+            )
+            st.plotly_chart(fig, width="stretch", key=f"bx_detail_chart_{b['id']}")
+            latest_rec = max(b_rows, key=lambda r: r["date"])
+            agg_note = (
+                "" if bx_period == "Per session"
+                else f", aggregated {bx_period.lower()} ({'total' if b['measurement'] in _GRAPH_SUM_MEASUREMENTS else 'average'})"
+            )
+            st.caption(
+                f"Showing {len(df_b)} point(s){agg_note}. Most recent session: "
+                f"**{behavior_value_display(b, latest_rec)}** on "
+                f"{_fmt_date(latest_rec['date'])}."
+            )
+            if overlay_notes:
+                st.caption(" · ".join(overlay_notes) + ".")
+
+        with st.expander("📐 Compare time frames (all at once)", expanded=False):
+            st.caption(
+                "The same line graph at every time window, side by side. Uses "
+                "your current **aggregation** and **trend/level** toggles above."
+            )
+            _windows = list(GRAPH_WINDOW_OPTIONS.items())
+            _ncol = 2
+            for _start in range(0, len(_windows), _ncol):
+                _row = _windows[_start:_start + _ncol]
+                _cols = st.columns(_ncol)
+                for _col, (_wlabel, _wdays) in zip(_cols, _row):
+                    with _col:
+                        st.markdown(f"**{_wlabel}**")
+                        dfw = _aggregate_period(
+                            _filter_window(df_b_all, _wdays),
+                            b["measurement"], bx_period,
+                        )
+                        if dfw.empty:
+                            st.caption("_No sessions in this window._")
+                            continue
+                        if bx_period == "Per session":
+                            mfig = px.line(dfw, x="Date", y="Value", markers=True)
+                            mfig.update_traces(
+                                line=dict(color="#ea580c"),
+                                marker=dict(size=6, color="#ea580c",
+                                            line=dict(width=1, color="white")),
+                                hovertemplate="%{x|%b %-d, %Y}: "
+                                "%{y:.0f}<extra></extra>",
+                            )
+                        else:
+                            mfig = px.bar(dfw, x="Date", y="Value")
+                            mfig.update_traces(
+                                marker_color="#ea580c", marker_line_width=0,
+                                hovertemplate="%{x|%b %-d, %Y}: "
+                                "%{y:.0f}<extra></extra>",
+                            )
+                        mfig.update_yaxes(
+                            title=None, rangemode="tozero",
+                            gridcolor="#f0eeec", zeroline=False,
+                            tickfont=dict(size=9),
+                        )
+                        _integer_yaxis(mfig, dfw["Value"])
+                        mfig.update_xaxes(
+                            title=None, gridcolor="#f0eeec", zeroline=False,
+                            tickfont=dict(size=9),
+                            showline=True, linecolor="#d6d3d1", linewidth=1,
+                        )
+                        _apply_period_xticks(mfig, bx_period)
+                        if show_level:
+                            _lv = float(dfw["Value"].mean())
+                            mfig.add_hline(
+                                y=_lv,
+                                line=dict(color="#0ea5e9", width=1.5, dash="dot"),
+                            )
+                        if show_trend:
+                            _ft = _best_fit_line(dfw["Date"], dfw["Value"])
+                            if _ft:
+                                _x0, _x1, _y0, _y1, _s = _ft
+                                mfig.add_scatter(
+                                    x=[_x0, _x1], y=[_y0, _y1], mode="lines",
+                                    line=dict(color="#1c1917", width=1.5,
+                                              dash="dash"),
+                                    hoverinfo="skip", showlegend=False,
+                                )
+                        mfig.update_layout(
+                            margin=dict(l=6, r=6, t=6, b=6),
+                            height=200,
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            showlegend=False,
+                            hoverlabel=dict(bgcolor="white", bordercolor="#e7e5e4"),
+                            font=dict(
+                                family="-apple-system, BlinkMacSystemFont, "
+                                "Inter, sans-serif",
+                                color="#1c1917",
+                            ),
+                        )
+                        st.plotly_chart(
+                            mfig, width="stretch",
+                            key=f"bx_multi_{b['id']}_{_wlabel}",
+                        )
+                        st.caption(f"{len(dfw)} point(s)")
 
         # ── Standard Celeration Chart ────────────────────────────────────────
         st.subheader("Standard Celeration Chart")
+        st.caption(
+            "Respects the time window above; per-session points only — the SCC "
+            "is never aggregated."
+        )
+        scc_cutoff = (
+            pd.Timestamp(date.today()) - pd.Timedelta(days=bx_window_days)
+            if bx_window_days is not None else None
+        )
+        scc_lo = pd.Timestamp(bx_custom[0]) if bx_custom else None
+        scc_hi = pd.Timestamp(bx_custom[1]) if bx_custom else None
         scc_rows = []
         for r in b_rows:
+            r_date = pd.to_datetime(r["date"])
+            if bx_custom is not None:
+                if r_date < scc_lo or r_date > scc_hi:
+                    continue
+            elif scc_cutoff is not None and r_date < scc_cutoff:
+                continue
             raw = _record_display_value(b, r)
             # Convert to count-per-minute when the source is rate (per-hour).
             value_per_min = raw / 60.0 if b["measurement"] == "rate" else raw
             scc_rows.append({
-                "Date": pd.to_datetime(r["date"]),
+                "Date": r_date,
                 "Value": max(float(value_per_min), 0.001),  # log floor
             })
+        if not scc_rows:
+            st.info("No sessions in the selected time window.")
+            return
         df_scc = pd.DataFrame(scc_rows).sort_values("Date")
         scc_y_label = (
             "Count per minute"
@@ -6312,6 +7492,124 @@ def page_target_bank():
                                 st.session_state.pop(pending_bank_del, None)
                                 st.rerun()
 
+    # ── Duplicate finder (within operant) ────────────────────────────────────
+    if bank:
+        st.divider()
+        with st.expander("🔁 Find duplicates within an operant", expanded=False):
+            st.caption(
+                "Finds targets whose description appears more than once **within "
+                "the same operant** (skill list ignored). The same word across "
+                "different operants isn't flagged — only repeats inside one operant."
+            )
+            dup_groups: dict[tuple[str, str], list[dict]] = {}
+            for b in bank:
+                key = (b.get("domain", ""), b["description"].strip().lower())
+                dup_groups.setdefault(key, []).append(b)
+            dup_groups = {k: v for k, v in dup_groups.items() if len(v) > 1}
+            dup_ops = sorted({op for (op, _desc) in dup_groups})
+
+            if not dup_groups:
+                st.success("No duplicates found within any operant. ✓")
+            else:
+                n_groups = len(dup_groups)
+                n_redundant = sum(len(v) - 1 for v in dup_groups.values())
+                st.caption(
+                    f"**{n_groups}** duplicated description(s) across "
+                    f"**{len(dup_ops)}** operant(s) · **{n_redundant}** redundant "
+                    f"entry(ies) (extra copies beyond the first)."
+                )
+                scope = st.selectbox(
+                    "Operant",
+                    options=["All operants"] + dup_ops,
+                    key="bank_dup_op_scope",
+                )
+                rows: list[dict] = []
+                ordered_ids: list[str] = []
+                for (op, _desc), entries in sorted(
+                    dup_groups.items(), key=lambda kv: (kv[0][0], kv[0][1])
+                ):
+                    if scope != "All operants" and op != scope:
+                        continue
+                    ordered = sorted(
+                        entries, key=lambda x: (x.get("skill_list") or "").lower()
+                    )
+                    for j, e in enumerate(ordered):
+                        ordered_ids.append(e["id"])
+                        rows.append({
+                            "Select": False,
+                            "Operant": op,
+                            "Target": e["description"],
+                            "List": e.get("skill_list", "") or "—",
+                            "Cons. Y": int(e.get("mastery_n", DEFAULT_MASTERY_N)),
+                            "Copy": f"{j + 1} of {len(ordered)}",
+                        })
+
+                if not rows:
+                    st.caption("No duplicates in this operant.")
+                else:
+                    st.caption(
+                        "Check the copies you want to remove. Within each group, "
+                        "leave at least one unchecked to keep it."
+                    )
+                    dup_ver = st.session_state.get("bank_dup_ver", 0)
+                    dup_edited = st.data_editor(
+                        pd.DataFrame(rows),
+                        width="stretch",
+                        hide_index=True,
+                        key=f"bank_dup_editor_{scope}_{dup_ver}",
+                        column_config={
+                            "Select": st.column_config.CheckboxColumn("✓", default=False),
+                            "Operant": st.column_config.TextColumn(disabled=True),
+                            "Target": st.column_config.TextColumn(disabled=True),
+                            "List": st.column_config.TextColumn(disabled=True),
+                            "Cons. Y": st.column_config.NumberColumn(disabled=True),
+                            "Copy": st.column_config.TextColumn(disabled=True),
+                        },
+                    )
+                    dup_selected_ids = [
+                        ordered_ids[i]
+                        for i, row in enumerate(dup_edited.to_dict("records"))
+                        if row.get("Select")
+                    ]
+                    dup_pending = "bank_dup_pending_delete"
+                    if not st.session_state.get(dup_pending):
+                        if st.button(
+                            f"🗑️ Remove {len(dup_selected_ids)} selected duplicate(s)",
+                            key="bank_dup_del_btn",
+                            disabled=not dup_selected_ids,
+                            width="stretch",
+                        ):
+                            st.session_state[dup_pending] = dup_selected_ids
+                            st.rerun()
+                    else:
+                        ids_set = set(st.session_state[dup_pending])
+                        st.warning(
+                            f"**Remove {len(ids_set)} duplicate entry(ies) from the "
+                            "bank?** Student copies of these targets are kept."
+                        )
+                        dcy, dcn = st.columns(2)
+                        with dcy:
+                            if st.button(
+                                "Yes, remove", key="bank_dup_del_yes",
+                                type="primary", width="stretch",
+                            ):
+                                save_target_bank(
+                                    [b for b in load_target_bank()
+                                     if b["id"] not in ids_set]
+                                )
+                                st.session_state.pop(dup_pending, None)
+                                st.session_state["bank_dup_ver"] = (
+                                    st.session_state.get("bank_dup_ver", 0) + 1
+                                )
+                                st.toast(f"Removed {len(ids_set)} duplicate(s).")
+                                st.rerun()
+                        with dcn:
+                            if st.button(
+                                "Cancel", key="bank_dup_del_no", width="stretch",
+                            ):
+                                st.session_state.pop(dup_pending, None)
+                                st.rerun()
+
     # ── Lists overview (drill-down) ──────────────────────────────────────────
     st.divider()
     with st.expander("📋 List overview", expanded=False):
@@ -6514,6 +7812,325 @@ def page_target_bank():
             st.rerun()
 
 
+def page_intervention_bank():
+    st.header("Intervention Bank")
+    st.caption(
+        "A reusable library of interventions, grouped by category. Add your "
+        "own, then attach them to a behavior of concern from its detail page "
+        "(where you can also drop a phase-change line when one starts)."
+    )
+
+    bank = load_intervention_bank()
+
+    # ── Add a new intervention ───────────────────────────────────────────────
+    existing_cats = sorted(
+        {b["category"] for b in bank} | set(INTERVENTION_CATEGORIES)
+    )
+    with st.expander("➕ Add an intervention", expanded=False):
+        ver = st.session_state.get("iv_add_ver", 0)
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            NEW_CAT = "➕ New category…"
+            cat_pick = st.selectbox(
+                "Category",
+                options=existing_cats + [NEW_CAT],
+                key=f"iv_add_cat_{ver}",
+            )
+            if cat_pick == NEW_CAT:
+                category = st.text_input(
+                    "New category name", key=f"iv_add_newcat_{ver}",
+                ).strip()
+            else:
+                category = cat_pick
+        with c2:
+            name = st.text_input(
+                "Intervention", key=f"iv_add_name_{ver}",
+                placeholder="e.g., Increase reinforcer variety",
+            )
+        if st.button(
+            "Add to bank", type="primary", disabled=not (name.strip() and category),
+            key=f"iv_add_btn_{ver}",
+        ):
+            rec = add_intervention_to_bank(category, name)
+            if rec:
+                st.session_state["iv_add_ver"] = ver + 1
+                st.toast(f"Added: {rec['name']}")
+                st.rerun()
+            else:
+                st.warning("That intervention is already in the bank.")
+
+    # ── Browse by category ───────────────────────────────────────────────────
+    by_cat: dict[str, list[dict]] = {}
+    for b in bank:
+        by_cat.setdefault(b.get("category", "Uncategorized"), []).append(b)
+
+    if not bank:
+        st.info("The bank is empty.")
+        return
+
+    st.caption(f"**{len(bank)}** interventions across **{len(by_cat)}** categories.")
+    all_cats = sorted({b["category"] for b in bank} | set(INTERVENTION_CATEGORIES))
+    editing = st.session_state.get("iv_editing")
+    pending_del = st.session_state.get("iv_pending_del")
+    for cat in sorted(by_cat):
+        desc = INTERVENTION_CATEGORIES.get(cat, "")
+        label = f"{cat}" + (f" — {desc}" if desc else "")
+        with st.expander(f"{label}  ({len(by_cat[cat])})", expanded=True):
+            for iv in sorted(by_cat[cat], key=lambda x: x["name"].lower()):
+                # ── Edit mode ────────────────────────────────────────────────
+                if editing == iv["id"]:
+                    with st.container(border=True):
+                        e1, e2 = st.columns([2, 1])
+                        new_name = e1.text_input(
+                            "Intervention", value=iv["name"],
+                            key=f"iv_edit_name_{iv['id']}",
+                        )
+                        new_cat = e2.selectbox(
+                            "Category", all_cats,
+                            index=(all_cats.index(iv["category"])
+                                   if iv["category"] in all_cats else 0),
+                            key=f"iv_edit_cat_{iv['id']}",
+                        )
+                        s1, s2 = st.columns(2)
+                        if s1.button(
+                            "💾 Save", key=f"iv_edit_save_{iv['id']}",
+                            type="primary", width="stretch",
+                            disabled=not new_name.strip(),
+                        ):
+                            allb = load_intervention_bank()
+                            for x in allb:
+                                if x["id"] == iv["id"]:
+                                    x["name"] = new_name.strip()
+                                    x["category"] = new_cat
+                                    break
+                            save_intervention_bank(allb)
+                            st.session_state.pop("iv_editing", None)
+                            st.toast("Saved.")
+                            st.rerun()
+                        if s2.button(
+                            "Cancel", key=f"iv_edit_cancel_{iv['id']}",
+                            width="stretch",
+                        ):
+                            st.session_state.pop("iv_editing", None)
+                            st.rerun()
+                    continue
+                # ── Delete confirmation (warning) ────────────────────────────
+                if pending_del == iv["id"]:
+                    st.warning(
+                        f"**Delete \"{iv['name']}\" from the bank?** This can't "
+                        "be undone. Behaviors already using it keep their copy."
+                    )
+                    d1, d2 = st.columns(2)
+                    if d1.button(
+                        "Yes, delete", key=f"iv_del_yes_{iv['id']}",
+                        type="primary", width="stretch",
+                    ):
+                        save_intervention_bank(
+                            [x for x in load_intervention_bank()
+                             if x["id"] != iv["id"]]
+                        )
+                        st.session_state.pop("iv_pending_del", None)
+                        st.toast(f"Deleted: {iv['name']}")
+                        st.rerun()
+                    if d2.button(
+                        "Cancel", key=f"iv_del_no_{iv['id']}", width="stretch",
+                    ):
+                        st.session_state.pop("iv_pending_del", None)
+                        st.rerun()
+                    continue
+                # ── Normal row ───────────────────────────────────────────────
+                row = st.columns([7, 1, 1])
+                row[0].write(f"• {iv['name']}")
+                if row[1].button("✎", key=f"iv_edit_{iv['id']}", help="Edit"):
+                    st.session_state["iv_editing"] = iv["id"]
+                    st.session_state.pop("iv_pending_del", None)
+                    st.rerun()
+                if row[2].button(
+                    "🗑️", key=f"iv_del_{iv['id']}", help="Delete from bank",
+                ):
+                    st.session_state["iv_pending_del"] = iv["id"]
+                    st.session_state.pop("iv_editing", None)
+                    st.rerun()
+
+
+def _cumulative_mastery_fig(sid: str, operant: str | None, view: str):
+    """Build the cumulative-mastery figure. Returns (fig, y_series) or None.
+
+    ``operant`` scopes to one operant (single line). Otherwise ``view`` selects
+    'Combined total' (one filled line) or per-operant lines.
+    """
+    if operant is not None:
+        s = cumulative_mastery_series(sid, operant)
+        if s.empty or int(s["total"].max()) <= 0:
+            return None
+        df = s.rename(columns={"date": "Date", "total": "Mastered"})
+        fig = px.line(df, x="Date", y="Mastered", markers=True)
+        fig.update_traces(
+            line=dict(color="#ea580c"),
+            marker=dict(size=5, color="#ea580c", line=dict(width=1, color="white")),
+            hovertemplate="%{x|%b %-d, %Y}: %{y:.0f} mastered<extra></extra>",
+        )
+        return fig, df["Mastered"]
+
+    targets = load_targets()
+    ops = sorted({
+        t["domain"] for t in targets
+        if t.get("student_id") == sid and t.get("domain")
+    })
+    frames = []
+    for op in ops:
+        s = cumulative_mastery_series(sid, op)
+        if not s.empty and int(s["total"].max()) > 0:
+            s = s.copy()
+            s["Operant"] = op
+            frames.append(s)
+    if not frames:
+        return None
+    if view == "Combined total":
+        df = cumulative_mastery_series(sid).rename(
+            columns={"date": "Date", "total": "Mastered"}
+        )
+        fig = px.area(df, x="Date", y="Mastered")
+        fig.update_traces(
+            line=dict(color="#ea580c", width=2),
+            fillcolor="rgba(234,88,12,0.12)",
+            hovertemplate="%{x|%b %-d, %Y}: %{y:.0f} mastered<extra></extra>",
+        )
+        return fig, df["Mastered"]
+    df = pd.concat(frames, ignore_index=True).rename(
+        columns={"date": "Date", "total": "Mastered"}
+    )
+    fig = px.line(df, x="Date", y="Mastered", color="Operant", markers=True)
+    fig.update_traces(
+        marker=dict(size=5, line=dict(width=1, color="white")),
+        hovertemplate="<b>%{fullData.name}</b><br>"
+        "%{x|%b %-d, %Y}: %{y:.0f} mastered<extra></extra>",
+    )
+    return fig, df["Mastered"]
+
+
+def _style_cumulative_fig(fig, y_series, *, show_legend: bool, height: int = 320):
+    fig.update_yaxes(
+        title="Targets mastered", rangemode="tozero",
+        gridcolor="#f0eeec", zeroline=False,
+    )
+    _integer_yaxis(fig, y_series)
+    fig.update_xaxes(
+        title=None, gridcolor="#f0eeec", zeroline=False,
+        showline=True, linecolor="#d6d3d1", linewidth=1,
+    )
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=height,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=show_legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, title=None),
+        hoverlabel=dict(bgcolor="white", bordercolor="#e7e5e4"),
+        font=dict(family="-apple-system, BlinkMacSystemFont, Inter, sans-serif",
+                  color="#1c1917"),
+    )
+
+
+def _render_cumulative_mastery(sid: str, operant: str | None = None) -> None:
+    """Cumulative running-total mastered-targets chart (all operants or one)."""
+    view = "By operant"
+    if operant is None:
+        view = st.radio(
+            "View", ["By operant", "Combined total"],
+            horizontal=True, key=f"cum_view_{sid}",
+            label_visibility="collapsed",
+        )
+    built = _cumulative_mastery_fig(sid, operant, view)
+    if built is None:
+        scope = f"{operant} " if operant else ""
+        st.caption(
+            f"No mastered {scope}targets yet — the cumulative chart appears "
+            "here as targets are mastered."
+        )
+        return
+    fig, y_series = built
+    _style_cumulative_fig(fig, y_series, show_legend=operant is None and view != "Combined total")
+    st.plotly_chart(
+        fig, width="stretch", key=f"cum_chart_{sid}_{operant or view}",
+    )
+    st.caption(
+        "Running total of mastered targets at the end of each day "
+        "(probed-out targets included)."
+    )
+
+
+def _cumulative_mastery_png(sid: str, operant: str | None = None) -> bytes | None:
+    """Render the cumulative mastered-targets chart to a PNG for the PDF."""
+    built = _cumulative_mastery_fig(sid, operant, "By operant")
+    if built is None:
+        return None
+    fig, y_series = built
+    _style_cumulative_fig(fig, y_series, show_legend=operant is None, height=440)
+    fig.update_layout(
+        width=1100, height=440,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(l=70, r=30, t=40, b=60),
+        font=dict(family="Helvetica, Arial, sans-serif", color="#1c1917"),
+    )
+    fig.update_xaxes(tickangle=-35, tickfont=dict(size=11))
+    png = _safe_to_image(fig, scale=2)
+    if png:
+        return png
+    return _cumulative_mastery_png_mpl(sid, operant)
+
+
+def _cumulative_mastery_png_mpl(sid: str, operant: str | None) -> bytes | None:
+    """Matplotlib fallback for the cumulative mastered-targets chart."""
+    try:
+        import io as _io
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except Exception:
+        return None
+    series_map: dict[str, "pd.DataFrame"] = {}
+    if operant is not None:
+        s = cumulative_mastery_series(sid, operant)
+        if not s.empty and int(s["total"].max()) > 0:
+            series_map[operant] = s
+    else:
+        targets = load_targets()
+        for op in sorted({
+            t["domain"] for t in targets
+            if t.get("student_id") == sid and t.get("domain")
+        }):
+            s = cumulative_mastery_series(sid, op)
+            if not s.empty and int(s["total"].max()) > 0:
+                series_map[op] = s
+    if not series_map:
+        return None
+    fig, ax = plt.subplots(figsize=(12, 4.8), dpi=160)
+    for op, s in series_map.items():
+        ax.plot(s["date"], s["total"], linewidth=2, label=op)
+    ax.set_ylabel("Targets mastered", fontsize=12, labelpad=10)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, color="#f0eeec", linewidth=1)
+    ax.set_axisbelow(True)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    for spine in ("left", "bottom"):
+        ax.spines[spine].set_color("#d6d3d1")
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d/%y"))
+    for label in ax.get_xticklabels():
+        label.set_rotation(-35)
+        label.set_horizontalalignment("left")
+    if operant is None:
+        ax.legend(loc="upper left", fontsize=9, frameon=False, ncol=3)
+    fig.tight_layout()
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def page_student_dashboard():
     students = load_students()
     if not students:
@@ -6627,6 +8244,10 @@ def page_student_dashboard():
             ):
                 st.session_state["page"] = "VB-MAPP Assessment"
                 st.rerun()
+
+    st.divider()
+    st.subheader("📈 Cumulative mastered targets")
+    _render_cumulative_mastery(sid)
 
 
 # ── EFL Assessment (freestanding) ────────────────────────────────────────────
@@ -6914,6 +8535,1410 @@ def save_efl_for_student(student_id: str, record: dict) -> None:
     save_efl(rows)
 
 
+# ── EFL Problem Behavior Summary ──────────────────────────────────────────────
+# A digital version of the EFL "Summary of the Learner's Assessments and
+# Subsequent Progress on Problem Behavior" sheet. For up to two problem
+# behaviors, the clinician records — at the initial assessment and at the end of
+# four follow-up time periods — where the learner falls on each scale (type,
+# intensity, medications, restraints, protective equipment, crisis
+# stabilization, self-restraints, and frequency). On the paper form each time
+# period is a color; here each period is a colored chip in the chosen cell.
+EFL_PB_FILE = os.path.join(DATA_DIR, "efl_pb_summaries.json")
+
+EFL_PB_BEHAVIORS = [
+    ("PB1", "PB1 (Problem Behavior 1)"),
+    ("PB2", "PB2 (Problem Behavior 2)"),
+]
+
+# Period key → display label. "initial" plus four follow-up periods.
+EFL_PB_PERIODS = [
+    ("initial", "Initial assessment"),
+    ("tp1", "Time period 1"),
+    ("tp2", "Time period 2"),
+    ("tp3", "Time period 3"),
+    ("tp4", "Time period 4"),
+]
+
+# Period key → RGB chip color used in the grid + PDF (mirrors "enter a color").
+EFL_PB_PERIOD_COLORS = {
+    "initial": (28, 25, 23),    # near-black
+    "tp1": (37, 99, 235),       # blue
+    "tp2": (22, 163, 74),       # green
+    "tp3": (234, 88, 12),       # orange
+    "tp4": (147, 51, 234),      # purple
+}
+
+# Each scale on the form: storage key, on-screen label, short PDF label, and the
+# ordered option cells (most → least, matching the sheet's left-to-right order).
+EFL_PB_DIMENSIONS = [
+    {"key": "measure", "label": "Measure (IA / IM)", "pdf": "Measure",
+     "options": ["IA", "IM"]},
+    {"key": "basis", "label": "Basis (Instance / Episode)", "pdf": "Basis",
+     "options": ["Instance", "Episode"]},
+    {"key": "type", "label": "Type of problem behavior", "pdf": "Type",
+     "options": ["SIB", "Agg", "Des", "Dis", "Rep"]},
+    {"key": "intensity", "label": "Intensity", "pdf": "Intensity",
+     "options": ["Sev", "Mod", "Mild"]},
+    {"key": "meds", "label": "Psychoactive medications", "pdf": "Medications",
+     "options": ["Med3+>", "Med3+", "Med3+<", "Med2>", "Med2", "Med2<",
+                 "Med1>", "Med1", "Med1<", "-Med"]},
+    {"key": "mech", "label": "Mechanical restraints", "pdf": "Mech. restraints",
+     "options": ["MRA", "MRC", "MR>2", "MR>1", "MR", "MR<1", "MR<2", "MR<3",
+                 "-MR"]},
+    {"key": "prot", "label": "Protective equipment", "pdf": "Protective equip.",
+     "options": ["PEA", "PEC", "PE>2", "PE>1", "PE", "PE<1", "PE<2", "PE<3",
+                 "-PE"]},
+    {"key": "crisis", "label": "Crisis stabilization", "pdf": "Crisis stab.",
+     "options": ["CS>5hW", "CS 2-5hW", "CS 1-2hW", "CS 30m-1hW", "CS<30mW",
+                 "-CS"]},
+    {"key": "selfrest", "label": "Self-restraints", "pdf": "Self-restraints",
+     "options": ["SR>2", "SR>1", "SR", "SR<1", "SR<2", "SR<3", "-SR"]},
+    {"key": "freq", "label": "Frequency of occurrence", "pdf": "Frequency",
+     "options": [">100D", "50-100D", "20-50D", "10-20D", "1-10D", "<1D",
+                 "<1W", "<1M", "<1Y"]},
+]
+
+# Legend text reproduced from the bottom of the paper form.
+EFL_PB_LEGEND = [
+    ("Type of problem behavior", [
+        "SIB - Self-injurious", "Agg - Aggressive", "Des - Destructive",
+        "Dis - Disruptive", "Rep - Repetitive"]),
+    ("Intensity", ["Sev - Severe", "Mod - Moderate", "Mild - Mild"]),
+    ("Psychoactive medications", [
+        "Med3+>  3+ meds, some dosage increases",
+        "Med3+   3+ medications",
+        "Med3+<  3+ meds, some dosage reductions",
+        "Med2>   2 meds, some dosage increases",
+        "Med2    2 medications",
+        "Med2<   2 meds, some dosage reductions",
+        "Med1>   1 med, some dosage increases",
+        "Med1    1 medication",
+        "Med1<   1 med, some dosage reductions",
+        "-Med    No medications"]),
+    ("Mechanical restraints  (MRA continuous / MRC contingent)", [
+        "MR>2  increased twice", "MR>1  increased once",
+        "MR    at initial assessment", "MR<1  partially faded once",
+        "MR<2  partially faded twice", "MR<3  partially faded 3x",
+        "-MR   not required"]),
+    ("Protective equipment  (PEA continuous / PEC contingent)", [
+        "PE>2  increased twice", "PE>1  increased once",
+        "PE    at initial assessment", "PE<1  partially faded once",
+        "PE<2  partially faded twice", "PE<3  partially faded 3x",
+        "-PE   not required"]),
+    ("Crisis stabilization procedures", [
+        "CS>5hW    used > 5 hours/week", "CS 2-5hW  used 2-5 hours/week",
+        "CS 1-2hW  used 1-2 hours/week", "CS 30m-1hW used 30 min-1 hour/week",
+        "CS<30mW   used < 30 min/week", "-CS       not required"]),
+    ("Self-restraints", [
+        "SR>2  increased twice", "SR>1  increased once",
+        "SR    at initial assessment", "SR<1  partially faded once",
+        "SR<2  partially faded twice", "SR<3  partially faded 3x",
+        "-SR   not occurring"]),
+    ("Frequency of occurrence (per day unless noted)", [
+        ">100D  > 100 instances/day", "50-100D  50-100/day",
+        "20-50D  20-50/day", "10-20D  10-20/day", "1-10D  1-10/day",
+        "<1D  less than once/day", "<1W  less than once/week",
+        "<1M  less than once/month", "<1Y  not in one year"]),
+]
+
+
+def load_efl_pb() -> list[dict[str, Any]]:
+    return _load(EFL_PB_FILE)
+
+
+def save_efl_pb(rows): _save(EFL_PB_FILE, rows)
+
+
+def _empty_efl_pb_behavior() -> dict:
+    return {
+        "name": "",
+        "absence_skills": "",
+        "periods": {
+            pk: {d["key"]: "-" for d in EFL_PB_DIMENSIONS}
+            for pk, _ in EFL_PB_PERIODS
+        },
+    }
+
+
+def efl_pb_for_student(student_id: str) -> dict:
+    """Return the student's PB-summary record, creating an empty shell if absent
+    and backfilling any newly added behaviors / periods / dimensions."""
+    rows = load_efl_pb()
+    rec = next((r for r in rows if r.get("student_id") == student_id), None)
+    if rec is None:
+        rec = {"student_id": student_id, "behaviors": {}}
+    rec.setdefault("behaviors", {})
+    for bk, _ in EFL_PB_BEHAVIORS:
+        b = rec["behaviors"].setdefault(bk, _empty_efl_pb_behavior())
+        b.setdefault("name", "")
+        b.setdefault("absence_skills", "")
+        periods = b.setdefault("periods", {})
+        for pk, _ in EFL_PB_PERIODS:
+            cell = periods.setdefault(pk, {})
+            for d in EFL_PB_DIMENSIONS:
+                cell.setdefault(d["key"], "-")
+    return rec
+
+
+def save_efl_pb_for_student(student_id: str, record: dict) -> None:
+    rows = load_efl_pb()
+    for i, r in enumerate(rows):
+        if r.get("student_id") == student_id:
+            rows[i] = record
+            break
+    else:
+        rows.append(record)
+    save_efl_pb(rows)
+
+
+def _pb_grid_row(pdf, label, options, sel_by_option,
+                 x0, label_w, cell_w, row_h):
+    """Draw one labeled scale row: a label then a cell per option, with a small
+    colored chip in any cell selected by a time period. ``sel_by_option`` maps
+    option → list of period keys that landed on it."""
+    if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+        pdf.add_page()
+    y = pdf.get_y()
+    pdf.set_font("Helvetica", "B", 6.5)
+    pdf.set_text_color(70, 70, 70)
+    pdf.set_xy(x0, y + (row_h - 3) / 2)
+    pdf.cell(label_w - 1.5, 3, _pdf_safe(label), align="L")
+    x = x0 + label_w
+    for opt in options:
+        pdf.set_draw_color(170, 170, 170)
+        pdf.set_line_width(0.2)
+        pdf.rect(x, y, cell_w, row_h)
+        pdf.set_font("Helvetica", "", 5.6)
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_xy(x, y + 0.8)
+        pdf.cell(cell_w, 2.6, _pdf_safe(opt), align="C")
+        periods = sel_by_option.get(opt, [])
+        if periods:
+            chip, gap = 1.9, 0.5
+            total = len(periods) * chip + (len(periods) - 1) * gap
+            sx = x + (cell_w - total) / 2
+            sy = y + row_h - chip - 0.7
+            for pk in periods:
+                pdf.set_fill_color(*EFL_PB_PERIOD_COLORS.get(pk, (0, 0, 0)))
+                pdf.rect(sx, sy, chip, chip, style="F")
+                sx += chip + gap
+        x += cell_w
+    pdf.set_xy(x0, y + row_h)
+
+
+def build_efl_pb_pdf(student: dict, record: dict) -> bytes:
+    name = student.get("name", "")
+    pdf = _pdf_init(f"EFL Problem Behavior Summary · {name}")
+    avail_w = pdf.w - pdf.l_margin - pdf.r_margin
+
+    # Title block.
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_text_color(28, 25, 23)
+    pdf.cell(0, 7, "ESSENTIAL FOR LIVING",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.cell(0, 5,
+             _pdf_safe("A Summary of the Learner's Assessments and Subsequent "
+                       "Progress on Problem Behavior"),
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+    pdf.ln(1.5)
+    _pdf_kv_row(pdf, "Learner", name or "-")
+    _pdf_kv_row(pdf, "Generated", _fmt_date(date.today().isoformat()))
+    pdf.ln(1)
+
+    # Period color legend.
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.set_text_color(70, 70, 70)
+    x = pdf.l_margin
+    y = pdf.get_y()
+    for pk, plabel in EFL_PB_PERIODS:
+        pdf.set_fill_color(*EFL_PB_PERIOD_COLORS[pk])
+        pdf.rect(x, y + 0.4, 3, 3, style="F")
+        pdf.set_xy(x + 3.8, y)
+        pdf.cell(34, 4, _pdf_safe(plabel))
+        x += 40
+    pdf.set_y(y + 5.5)
+
+    label_w = 30.0
+    n_cols_max = max(len(d["options"]) for d in EFL_PB_DIMENSIONS)
+    cell_w = (avail_w - label_w) / n_cols_max
+    row_h = 6.2
+
+    for bk, blabel in EFL_PB_BEHAVIORS:
+        b = record.get("behaviors", {}).get(bk, {})
+        block_h = 7 + row_h * len(EFL_PB_DIMENSIONS) + 12
+        if pdf.get_y() + block_h > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.ln(2)
+        pdf.set_fill_color(245, 244, 242)
+        pdf.set_draw_color(120, 113, 108)
+        pdf.set_line_width(0.3)
+        by = pdf.get_y()
+        pdf.rect(pdf.l_margin, by, avail_w, 6, style="DF")
+        pdf.set_xy(pdf.l_margin + 1.5, by + 1.2)
+        pdf.set_font("Helvetica", "B", 8.5)
+        pdf.set_text_color(28, 25, 23)
+        nm = (b.get("name") or "").strip()
+        pdf.cell(0, 3.6, _pdf_safe(f"{blabel}:  {nm}" if nm else f"{blabel}:"))
+        pdf.set_y(by + 7)
+
+        periods = b.get("periods", {})
+        for d in EFL_PB_DIMENSIONS:
+            sel_by_option: dict[str, list[str]] = {}
+            for pk, _ in EFL_PB_PERIODS:
+                val = (periods.get(pk, {}) or {}).get(d["key"], "-")
+                if val and val != "-" and val in d["options"]:
+                    sel_by_option.setdefault(val, []).append(pk)
+            _pb_grid_row(pdf, d["pdf"], d["options"], sel_by_option,
+                         pdf.l_margin, label_w, cell_w, row_h)
+
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.set_text_color(90, 85, 80)
+        absence = (b.get("absence_skills") or "").strip()
+        pdf.multi_cell(
+            0, 3.6,
+            _pdf_safe(f"{bk} occurs in the absence of these skills: "
+                      f"{absence or '-'}"))
+
+    # Legend reference page.
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(28, 25, 23)
+    pdf.cell(0, 6, "Scale reference",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+    col_w = avail_w / 2
+    for heading, lines in EFL_PB_LEGEND:
+        needed = 4.4 + len(lines) * 3.3 + 2
+        if pdf.get_y() + needed > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.set_font("Helvetica", "B", 7.8)
+        pdf.set_text_color(234, 88, 12)
+        pdf.cell(0, 4.2, _pdf_safe(heading),
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(50, 48, 46)
+        for ln in lines:
+            pdf.cell(0, 3.3, _pdf_safe(ln),
+                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1.5)
+
+    return _pdf_bytes(pdf)
+
+
+def _efl_pb_summary_section(sid: str, s: dict) -> None:
+    """Interactive EFL Problem Behavior Summary, saved per student."""
+    st.divider()
+    st.subheader("Problem Behavior Summary")
+    st.caption(
+        "EFL *Summary of the Learner's Assessments and Subsequent Progress on "
+        "Problem Behavior*. For each problem behavior, pick where the learner "
+        "falls on every scale at the initial assessment and at the end of up to "
+        "four time periods. Each period is color-coded (like the paper form)."
+    )
+
+    # Period color legend.
+    legend = "  ".join(
+        f"<span style='display:inline-block;width:10px;height:10px;"
+        f"background:rgb{EFL_PB_PERIOD_COLORS[pk]};border-radius:2px;"
+        f"margin:0 3px -1px 0'></span>{plabel}"
+        for pk, plabel in EFL_PB_PERIODS
+    )
+    st.markdown(legend, unsafe_allow_html=True)
+
+    rec = efl_pb_for_student(sid)
+    pbver = st.session_state.get("efl_pb_ver", 0)
+
+    period_labels = [lbl for _, lbl in EFL_PB_PERIODS]
+    label_to_pk = {lbl: pk for pk, lbl in EFL_PB_PERIODS}
+    edits: dict[str, Any] = {}
+    name_inputs: dict[str, str] = {}
+    absence_inputs: dict[str, str] = {}
+
+    pb_col_config = {
+        "Period": st.column_config.TextColumn(width="small", disabled=True),
+    }
+    for d in EFL_PB_DIMENSIONS:
+        pb_col_config[d["label"]] = st.column_config.SelectboxColumn(
+            d["label"], options=["-"] + d["options"], required=False,
+            width="small",
+        )
+
+    tabs = st.tabs([lbl for _, lbl in EFL_PB_BEHAVIORS])
+    for tab, (bk, blabel) in zip(tabs, EFL_PB_BEHAVIORS):
+        with tab:
+            b = rec["behaviors"][bk]
+            name_inputs[bk] = st.text_input(
+                f"{blabel} — behavior",
+                value=b.get("name", ""),
+                placeholder="e.g. hitting others",
+                key=f"efl_pb_name_{bk}_{pbver}",
+            )
+            rows = []
+            for pk, plabel in EFL_PB_PERIODS:
+                cell = b["periods"].get(pk, {})
+                row = {"Period": plabel}
+                for d in EFL_PB_DIMENSIONS:
+                    v = cell.get(d["key"], "-")
+                    row[d["label"]] = v if v in (["-"] + d["options"]) else "-"
+                rows.append(row)
+            edits[bk] = st.data_editor(
+                pd.DataFrame(rows, columns=["Period"] +
+                             [d["label"] for d in EFL_PB_DIMENSIONS]),
+                width="stretch",
+                hide_index=True,
+                key=f"efl_pb_grid_{bk}_{pbver}",
+                column_config=pb_col_config,
+            )
+            absence_inputs[bk] = st.text_area(
+                f"{bk} occurs in the absence of these skills",
+                value=b.get("absence_skills", ""),
+                key=f"efl_pb_absence_{bk}_{pbver}",
+                height=70,
+            )
+
+    save_col, dl_col = st.columns(2)
+    with save_col:
+        if st.button(
+            "💾 Save problem behavior summary", type="primary",
+            width="stretch", key=f"efl_pb_save_{pbver}",
+        ):
+            for bk, _ in EFL_PB_BEHAVIORS:
+                b = rec["behaviors"][bk]
+                b["name"] = (name_inputs.get(bk, "") or "").strip()
+                b["absence_skills"] = (absence_inputs.get(bk, "") or "").strip()
+                for r in edits[bk].to_dict("records"):
+                    pk = label_to_pk.get(r.get("Period", ""))
+                    if not pk:
+                        continue
+                    for d in EFL_PB_DIMENSIONS:
+                        v = r.get(d["label"], "-")
+                        if v not in (["-"] + d["options"]):
+                            v = "-"
+                        b["periods"].setdefault(pk, {})[d["key"]] = v
+            save_efl_pb_for_student(sid, rec)
+            st.session_state["efl_pb_ver"] = pbver + 1
+            st.toast("Problem behavior summary saved.")
+            st.rerun()
+    with dl_col:
+        st.download_button(
+            "📄 Download summary PDF",
+            data=build_efl_pb_pdf(s, rec),
+            file_name=(
+                f"efl_pb_summary_{(s.get('name','') or 'learner').replace(' ', '_')}"
+                f"_{date.today().isoformat()}.pdf"
+            ),
+            mime="application/pdf",
+            width="stretch",
+            key=f"efl_pb_pdf_{pbver}",
+        )
+    st.caption(
+        "The PDF reflects the **last saved** data — save first if you just made "
+        "changes. A scale-reference legend is appended on the final page."
+    )
+
+
+# The 8 EFL "Must-Have" skills — overview cards shown atop the EFL report.
+# (icon emoji, title, subtitle).
+EFL_MUST_HAVE_SKILLS = [
+    ("🙋", "Making Requests", "[mands]"),
+    ("⏳", "Waiting after making requests", ""),
+    ("🔄", "Accepting Removals", "Transitions, Sharing, and Taking Turns"),
+    ("✅", "Completing Required Tasks",
+     "Completing Previously Acquired Tasks when asked to do so"),
+    ("🚫", 'Accepting "No"', ""),
+    ("🧭", "Following Directions", "related to Health and Safety"),
+    ("🧼", "Completing Daily Living Skills", "related to Health and Safety"),
+    ("💪", "Tolerating Skills", "related to Health and Safety"),
+]
+
+
+def _efl_must_have_overview() -> None:
+    """Render the 8 Must-Have skills as a styled card grid (matches the EFL
+    one-pager)."""
+    cards = "".join(
+        f'<div class="efl-mh-card">'
+        f'<div class="efl-mh-icon">{icon}</div>'
+        f'<div class="efl-mh-num">{i}</div>'
+        f'<div class="efl-mh-title">{title}</div>'
+        + (f'<div class="efl-mh-sub">{sub}</div>' if sub else
+           '<div class="efl-mh-sub">&nbsp;</div>')
+        + '</div>'
+        for i, (icon, title, sub) in enumerate(EFL_MUST_HAVE_SKILLS, start=1)
+    )
+    st.markdown(
+        """
+        <style>
+        .efl-mh-wrap{background:#fdebef;border-radius:18px;
+          padding:26px 22px 30px;margin:4px 0 8px;}
+        .efl-mh-h1{text-align:center;font-weight:800;letter-spacing:2px;
+          font-size:34px;color:#1a1a1a;margin:0 0 8px;
+          font-family:'Arial Black','Helvetica Neue',sans-serif;}
+        .efl-mh-h1 .hl{color:#a4243b;}
+        .efl-mh-lead{text-align:center;color:#444;font-size:15px;margin:0 0 22px;}
+        .efl-mh-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;}
+        @media (max-width:1100px){.efl-mh-grid{grid-template-columns:repeat(2,1fr);}}
+        @media (max-width:620px){.efl-mh-grid{grid-template-columns:1fr;}}
+        .efl-mh-card{background:#fff;border-radius:16px;padding:22px 16px 20px;
+          text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.05);
+          display:flex;flex-direction:column;align-items:center;}
+        .efl-mh-icon{font-size:34px;line-height:1;margin-bottom:10px;}
+        .efl-mh-num{width:34px;height:34px;line-height:34px;border-radius:50%;
+          background:#a4243b;color:#fff;font-weight:700;margin:0 auto 12px;}
+        .efl-mh-title{font-weight:600;color:#222;font-size:16px;margin-bottom:4px;}
+        .efl-mh-sub{color:#666;font-size:13px;line-height:1.35;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="efl-mh-wrap">'
+        '<div class="efl-mh-h1">THE <span class="hl">MUST-HAVE</span> SKILLS</div>'
+        '<div class="efl-mh-lead">These skills are some of the first skills '
+        'addressed in Essential for Living.</div>'
+        f'<div class="efl-mh-grid">{cards}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── EFL Quick Assessment (QA) ─────────────────────────────────────────────────
+# The 18-area "Quick Assessment" rated 1-4. Items 3-10 are "The Essential
+# Eight". Stored per student.
+EFL_QA_FILE = os.path.join(DATA_DIR, "efl_qa.json")
+EFL_QA_SCALE = [1, 2, 3, 4]
+# Each item: number, label, Essential-Eight flag, prompt (definition), and the
+# four scale descriptors keyed 1-4.
+EFL_QA_ITEMS = [
+    {"num": 1, "label": "Spoken Words", "e8": False,
+     "prompt": "The extent to which a learner exhibits spontaneous, "
+               "understandable spoken words and the conditions under which "
+               "spoken-word repetitions occur",
+     "levels": {
+         1: "Exhibits only noises and a few sounds",
+         2: "Exhibits occasional words or spoken-word repetitions, but neither "
+            "are understandable",
+         3: "Exhibits a few spontaneous spoken words and spoken-word "
+            "repetitions, both of which are understandable",
+         4: "Exhibits many spontaneous, spoken-words, nearly typical "
+            "spoken-word interactions, and spoken-word repetitions when asked "
+            "to do so, all of which are understandable"}},
+    {"num": 2, "label": "Alternative Method of Speaking", "e8": False,
+     "prompt": "A method of speaking used by learners, who do not exhibit "
+               "understandable spoken words or spoken-word repetitions",
+     "levels": {
+         1: "Has no formal method of speaking or is using one or more "
+            "ineffective methods",
+         2: "A new alternative method of speaking is being tested",
+         3: "Has been using an effective, alternative method of speaking for "
+            "1-6 months",
+         4: "Has been using an effective, alternative method of speaking for "
+            "more than 6 months"}},
+    {"num": 3, "label": "Making Requests", "e8": True,
+     "prompt": "The tendency to make requests for highly preferred items and "
+               "activities",
+     "levels": {
+         1: "Makes requests by exhibiting problem behavior",
+         2: "Makes requests by leading others to items",
+         3: "Makes requests for 1-3 preferred items or activities with or "
+            "without prompts",
+         4: "Makes requests for 10 or more preferred items or activities "
+            "without prompts using and effective method of speaking"}},
+    {"num": 4, "label": "Waiting", "e8": True,
+     "prompt": "The tendency to wait when access to items or activities is "
+               "delayed after a request",
+     "levels": {
+         1: "Exhibits problem behavior when access is delayed for a few seconds",
+         2: "Waits for 1 minute with complaints or other minor disruptions",
+         3: "Waits for 5 minutes without complaints",
+         4: "Waits for 20 minutes without complaints"}},
+    {"num": 5,
+     "label": "Accepting Removals, Making Transitions, Sharing and Taking Turns",
+     "e8": True,
+     "prompt": "The tendency to accept the removal of preferred items and "
+               "activities by persons in authority or peers, to make "
+               "transitions from preferred activities to non-preferred ones, "
+               "and to share and take turns with preferred ones",
+     "levels": {
+         1: "Exhibits problem behavior when preferred items or activities are "
+            "removed, during transitions, or during required sharing or taking "
+            "turns",
+         2: "Makes complaints when preferred items or activities are removed, "
+            "during transitions, or during required sharing or taking turns",
+         3: "Complains when preferred items or activities are removed, during "
+            "transitions, or when required to share or take turns, but only "
+            "when motivating events are strong",
+         4: "Accepts the removal of items and activities, transitions, shares, "
+            "and takes turns without complaints"}},
+    {"num": 6,
+     "label": "Completing 10 Consecutive, Brief, Previously Acquired Tasks",
+     "e8": True,
+     "prompt": "The tendency to complete brief, previously acquired tasks "
+               "between opportunities to make requests",
+     "levels": {
+         1: "Exhibits problem behavior when directed to complete a brief, "
+            "previously acquired task",
+         2: "Completes 1-3 consecutive, brief, previously acquired tasks "
+            "without disruptive behavior",
+         3: "Completes 4-6 consecutive, brief, previously acquired tasks "
+            "without complaints",
+         4: "Completes 10 or more consecutive, brief, previously acquired "
+            "tasks of varying durations and requiring varying degrees of "
+            "effort without complaints"}},
+    {"num": 7, "label": "Accepting 'No'", "e8": True,
+     "prompt": "The tendency to accept 'no' when access to items or activities "
+               "is denied following requests that were taught and requests for "
+               "dangerous items and activities that were not taught",
+     "levels": {
+         1: 'Exhibits problem behavior when told "no"',
+         2: 'Complains when told "no"',
+         3: "Complains only when motivation related to the requested item or "
+            "activity is strong",
+         4: "Readily accepts \"no\" by continuing with ongoing activities"}},
+    {"num": 8, "label": "Following Directions Related to Health and Safety",
+     "e8": True,
+     "prompt": "The tendency to follow directions from others that insure "
+               "safety and that permit safe movement throughout the community",
+     "levels": {
+         1: "Does not follow any directions that involve matters of safety and "
+            "cannot be taken most places within the community without problem "
+            "behavior or risking safety",
+         2: 'Follows only a few directions and requires "hands on" supervision '
+            "at all times",
+         3: "Follows many directions related to safety and can be taken most "
+            "places in a group of three with one supervisor",
+         4: "Follows all directions that involve matters of health and safety "
+            "and can be taken anywhere with minimal supervision"}},
+    {"num": 9,
+     "label": "Completing Daily Living Skills Related to Health and Safety",
+     "e8": True,
+     "prompt": "The tendency to perform daily living skills which have an "
+               "immediate impact on the health and safety of the learner",
+     "levels": {
+         1: "Does not complete any daily living skills related to health and "
+            "safety without prompts, resistance to prompts, or problem behavior",
+         2: "Completes 1-3 daily living skills related to health and safety "
+            "with complaints, some resistance to prompts, or some problem "
+            "behavior",
+         3: "Completes 4-6 daily living skills related to health and safety",
+         4: "Completes most daily living skills related to health and safety"}},
+    {"num": 10,
+     "label": "Tolerating Situations Related to Health and Safety", "e8": True,
+     "prompt": "The tendency to tolerate unpleasant situations which have an "
+               "immediate impact on the health and safety of the learner",
+     "levels": {
+         1: "Because of intense episodes of problem behavior, instructors and "
+            "care providers occasionally avoid routine activities related to "
+            "health and safety",
+         2: "Tolerates 1-3 routine activities related to health and safety "
+            "with some complaints or problem behavior",
+         3: "Tolerates 4-6 routine activities related to health and safety",
+         4: "Tolerates most routine activities related to health and safety "
+            "without problem behavior"}},
+    {"num": 11, "label": "Matching", "e8": False,
+     "prompt": "The tendency to match items-to-items, photographs-to-items, "
+               "and text-to-items",
+     "levels": {
+         1: "Does not match identical items",
+         2: "Matches only identical items",
+         3: "Matches a few photographs or miniature items with items or "
+            "activities and vice versa",
+         4: "Matches photographs or miniature items, but not text, with items "
+            "or activities and vice versa"}},
+    {"num": 12, "label": "Imitation", "e8": False,
+     "prompt": "The tendency to imitate motor movements made by others",
+     "levels": {
+         1: "Does not imitate any movements",
+         2: "Imitates some finger, hand, arm movements, but not motor "
+            "movements with items",
+         3: "Imitates many finger, hand, arm movements and a few motor "
+            "movements with items",
+         4: "Imitates finger, hand, and arm movements and motor movements with "
+            "items, but does not copy words that have been written, typed, or "
+            "Braille-written"}},
+    {"num": 13, "label": "Other Daily Living Skills", "e8": False,
+     "prompt": "The tendency to perform daily living skills that do not have "
+               "an immediate impact on the health and safety of the learner",
+     "levels": {
+         1: "Does not complete any daily living skills not related to health "
+            "and safety without prompts, resistance to prompts, or problem "
+            "behavior",
+         2: "Completes 1-3 daily living skills not related to health and "
+            "safety with complaints, some resistance to prompts, or some "
+            "problem behavior",
+         3: "Completes 4-6 daily living skills not related to health and safety",
+         4: "Completes most daily living skills not related to health and "
+            "safety"}},
+    {"num": 14, "label": "Tolerating Other Situations", "e8": False,
+     "prompt": "The tendency to tolerate unpleasant situations which do not "
+               "have an immediate impact on the health and safety of the "
+               "learner",
+     "levels": {
+         1: "Because of intense episodes of problem behavior, instructors and "
+            "care providers occasionally avoid routine activities not related "
+            "to health and safety",
+         2: "Tolerates 1-3 routine activities not related to health and safety "
+            "with some complaints or problem behavior",
+         3: "Tolerates 4-6 routine activities not related to health and safety",
+         4: "Tolerates most routine activities not related to health and "
+            "safety without problem behavior"}},
+    {"num": 15, "label": "Naming and Describing", "e8": False,
+     "prompt": "The tendency to name and describe items, activities, people, "
+               "places, locations, and items with features that are part of "
+               "routine events",
+     "levels": {
+         1: "Does not exhibit any names or descriptions",
+         2: "Names some items and activities that are part of 1-3 routine "
+            "events",
+         3: "Names many items, activities, familiar people, and places that "
+            "are part of 4-6 routine events",
+         4: "Names or describes many items, activities, familiar people, "
+            "places, locations, and items with features that are part of 7 or "
+            "more routine events"}},
+    {"num": 16,
+     "label": "Following Directions, Recognizing, and Retrieving", "e8": False,
+     "prompt": "The tendency to follow directions, to recognize items, "
+               "activities, people, places, locations, and items with "
+               "features, and to retrieve items, people, and items with "
+               "features that are part of routine events",
+     "levels": {
+         1: "Does not follow directions to complete routine activities and "
+            "does not recognize or retrieve any item that is part of a routine "
+            "activity",
+         2: "Follows directions to complete routine activities, and recognizes "
+            "and retrieves some items that are part of 1-3 routine events",
+         3: "Recognizes and retrieves many items, activities, familiar people, "
+            "and places that are part of 4-6 routine events",
+         4: "Recognizes and retrieves many items, activities, familiar people, "
+            "places, locations, and items with features that are part of 7 or "
+            "more routine events"}},
+    {"num": 17, "label": "Answering Questions", "e8": False,
+     "prompt": "The tendency to answer questions that occur before, during, or "
+               "after routine events",
+     "levels": {
+         1: "Cannot answer any commonly occurring questions",
+         2: 'Answers some questions like "Do you want juice?", "Can you help '
+            'me?", "What do you want?", or "Which one do you want?" that are '
+            "part of 1-3 routine events",
+         3: 'Answers many questions like "Where are the napkins?", "Who is '
+            'that?", "What are you going to do?", "What are you going to get '
+            'at the mall?", "Who is helping you?", "Where are you going?", and '
+            '"When do you want your cigar?" that are a part of 4-6 routine '
+            "events",
+         4: 'Answers many questions like "What are you going to do after '
+            'lunch?", "Where did you put your blue pants?", and "Who is '
+            'driving you to the movies?" that are a part of 7 or more routine '
+            "events"}},
+    {"num": 18, "label": "Problem Behavior", "e8": False,
+     "prompt": "The tendency for the learner to exhibit problem behavior",
+     "levels": {
+         1: "Exhibits frequent and intense self-injurious, aggressive, or "
+            "destructive behavior",
+         2: "Exhibits infrequent and less intense self-injurious, aggressive, "
+            "or destructive behavior",
+         3: "Exhibits disruptive behavior or frequent complaining that "
+            "presents a problem",
+         4: "Does not exhibit problem behavior"}},
+]
+
+
+def load_efl_qa() -> list[dict[str, Any]]:
+    return _load(EFL_QA_FILE)
+
+
+def save_efl_qa(rows): _save(EFL_QA_FILE, rows)
+
+
+def efl_qa_for_student(student_id: str) -> dict:
+    rows = load_efl_qa()
+    rec = next((r for r in rows if r.get("student_id") == student_id), None)
+    if rec is None:
+        rec = {"student_id": student_id}
+    rec.setdefault("scores", {})
+    rec.setdefault("date", "")
+    rec.setdefault("assessor", "")
+    rec.setdefault("notes", "")
+    return rec
+
+
+def save_efl_qa_for_student(student_id: str, record: dict) -> None:
+    rows = load_efl_qa()
+    for i, r in enumerate(rows):
+        if r.get("student_id") == student_id:
+            rows[i] = record
+            break
+    else:
+        rows.append(record)
+    save_efl_qa(rows)
+
+
+def build_efl_qa_pdf(student: dict, record: dict) -> bytes:
+    name = student.get("name", "")
+    pdf = _pdf_init(f"EFL Quick Assessment · {name}")
+    avail = pdf.w - pdf.l_margin - pdf.r_margin
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(28, 25, 23)
+    pdf.cell(0, 7, "THE ESSENTIAL FOR LIVING QUICK ASSESSMENT (QA)",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+    _pdf_kv_row(pdf, "Learner", name or "-")
+    _pdf_kv_row(pdf, "Generated", _fmt_date(date.today().isoformat()))
+    if (record.get("date") or "").strip():
+        _pdf_kv_row(pdf, "Assessment date", _fmt_date(record["date"]))
+    if (record.get("assessor") or "").strip():
+        _pdf_kv_row(pdf, "Assessor", record["assessor"])
+    pdf.ln(2)
+
+    scores = record.get("scores", {})
+    cell_w, gap, box_h = 11.0, 2.0, 6.0
+    cells_w = len(EFL_QA_SCALE) * cell_w + (len(EFL_QA_SCALE) - 1) * gap
+    label_w = avail - cells_w
+
+    for item in EFL_QA_ITEMS:
+        num, label = item["num"], item["label"]
+        if num == 3:
+            if pdf.get_y() + 6 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(122, 30, 40)
+            pdf.cell(0, 5, "The Essential Eight (items 3-10)",
+                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        if pdf.get_y() + box_h + 1.5 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        y = pdf.get_y()
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(28, 25, 23)
+        pdf.set_xy(pdf.l_margin, y)
+        pdf.cell(label_w, box_h, _pdf_safe(f"{num}. {label}"), align="L")
+        x = pdf.l_margin + label_w
+        cur = scores.get(str(num))
+        for val in EFL_QA_SCALE:
+            sel = cur == val
+            if sel:
+                pdf.set_fill_color(37, 99, 235)
+                pdf.set_draw_color(37, 99, 235)
+                pdf.rect(x, y + 0.3, cell_w, box_h - 0.6, style="DF")
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font("Helvetica", "B", 8)
+            else:
+                pdf.set_draw_color(175, 175, 175)
+                pdf.rect(x, y + 0.3, cell_w, box_h - 0.6, style="D")
+                pdf.set_text_color(90, 90, 90)
+                pdf.set_font("Helvetica", "", 8)
+            pdf.set_xy(x, y + 0.3)
+            pdf.cell(cell_w, box_h - 0.6, str(val), align="C")
+            x += cell_w + gap
+        pdf.set_y(y + box_h + 1.5)
+
+    notes = (record.get("notes") or "").strip()
+    if notes:
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "B", 8.5)
+        pdf.set_text_color(28, 25, 23)
+        pdf.cell(0, 4.4, "Notes", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(60, 58, 56)
+        pdf.multi_cell(0, 4, _pdf_safe(notes))
+
+    # ── Scale descriptors reference ────────────────────────────────────────
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(28, 25, 23)
+    pdf.cell(0, 6, "Scale descriptors", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 113, 108)
+    pdf.cell(0, 4.4, "The selected score for each area is highlighted.",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1.5)
+    for item in EFL_QA_ITEMS:
+        num = item["num"]
+        cur = scores.get(str(num))
+        # Heading + prompt, kept together with at least the first descriptor.
+        if pdf.get_y() + 16 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(28, 25, 23)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(avail, 4.4, _pdf_safe(f"{num}. {item['label']}"))
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(120, 113, 108)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(avail, 3.8, _pdf_safe(item["prompt"]))
+        pdf.ln(0.5)
+        for val in EFL_QA_SCALE:
+            txt = item["levels"][val]
+            sel = cur == val
+            line = f"{val}.  {txt}"
+            if pdf.get_y() + 7 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            x0, y0 = pdf.l_margin, pdf.get_y()
+            if sel:
+                pdf.set_font("Helvetica", "B", 8.5)
+                pdf.set_text_color(37, 99, 235)
+            else:
+                pdf.set_font("Helvetica", "", 8.5)
+                pdf.set_text_color(55, 53, 51)
+            pdf.set_xy(x0 + 3, y0)
+            pdf.multi_cell(avail - 3, 4, _pdf_safe(line))
+            if sel:
+                # Accent bar beside the chosen descriptor.
+                pdf.set_fill_color(37, 99, 235)
+                pdf.rect(x0, y0 + 0.4, 1.4, pdf.get_y() - y0 - 0.8, style="F")
+        pdf.ln(2)
+
+    return _pdf_bytes(pdf)
+
+
+def _efl_qa_rows(items, scores, sid, show_desc=False) -> None:
+    for item in items:
+        num, label = item["num"], item["label"]
+        cols = st.columns([0.60, 0.10, 0.10, 0.10, 0.10])
+        cols[0].markdown(f"**{num}.** {label}")
+        cur = scores.get(str(num))
+        for idx, val in enumerate(EFL_QA_SCALE):
+            with cols[idx + 1]:
+                if st.button(
+                    str(val),
+                    key=f"efl_qa_{sid}_{num}_{val}",
+                    type="primary" if cur == val else "secondary",
+                    width="stretch",
+                    help=item["levels"].get(val, ""),
+                ):
+                    scores[str(num)] = None if cur == val else val
+                    st.rerun()
+        if show_desc:
+            st.caption(f"_{item['prompt']}_")
+            for val in EFL_QA_SCALE:
+                txt = item["levels"][val]
+                if cur == val:
+                    st.markdown(
+                        f"<div style='border-left:3px solid #2563eb;"
+                        f"padding-left:8px;margin:1px 0'><b>{val}.</b> {txt}</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"<div style='padding-left:11px;margin:1px 0;"
+                        f"color:#6b6b6b;font-size:0.86em'>{val}. {txt}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+def _efl_qa_section(sid: str, s: dict) -> None:
+    """Interactive EFL Quick Assessment (18 areas, scored 1-4), per student."""
+    st.divider()
+    st.subheader("Quick Assessment (QA)")
+    st.caption(
+        "The Essential for Living *Quick Assessment* — rate each of the 18 areas "
+        "**1–4**. Items **3–10** make up *The Essential Eight*. Click a number to "
+        "set it (click again to clear), then **Save**. Hover a number to see what "
+        "that score means."
+    )
+    show_desc = st.toggle(
+        "Show scale descriptors", key=f"efl_qa_showdesc_{sid}",
+        help="Show the full 1–4 descriptor text under each area.",
+    )
+
+    rec = efl_qa_for_student(sid)
+    ss_key = f"_efl_qa_scores_{sid}"
+    if ss_key not in st.session_state:
+        st.session_state[ss_key] = {
+            k: v for k, v in rec.get("scores", {}).items() if v
+        }
+    scores = st.session_state[ss_key]
+
+    mc = st.columns(2)
+    date_val = mc[0].text_input(
+        "Assessment date", value=rec.get("date", ""),
+        placeholder="YYYY-MM-DD", key=f"efl_qa_date_{sid}",
+    )
+    assessor_val = mc[1].text_input(
+        "Assessor", value=rec.get("assessor", ""), key=f"efl_qa_assessor_{sid}",
+    )
+
+    _efl_qa_rows([i for i in EFL_QA_ITEMS if i["num"] <= 2],
+                 scores, sid, show_desc)
+    with st.container(border=True):
+        st.markdown("**⟮ The Essential Eight ⟯**")
+        _efl_qa_rows([i for i in EFL_QA_ITEMS if 3 <= i["num"] <= 10],
+                     scores, sid, show_desc)
+    _efl_qa_rows([i for i in EFL_QA_ITEMS if i["num"] >= 11],
+                 scores, sid, show_desc)
+
+    notes_val = st.text_area(
+        "Notes", value=rec.get("notes", ""), key=f"efl_qa_notes_{sid}", height=70,
+    )
+
+    answered = sum(1 for v in scores.values() if v)
+    st.caption(f"Answered **{answered} / {len(EFL_QA_ITEMS)}** areas.")
+
+    # PDF reflects what's currently on screen (session scores + meta).
+    pdf_rec = {
+        "student_id": sid,
+        "scores": {k: v for k, v in scores.items() if v},
+        "date": date_val.strip(),
+        "assessor": assessor_val.strip(),
+        "notes": notes_val.strip(),
+    }
+
+    save_col, dl_col = st.columns(2)
+    with save_col:
+        if st.button(
+            "💾 Save Quick Assessment", type="primary", width="stretch",
+            key=f"efl_qa_save_{sid}",
+        ):
+            rec.update(pdf_rec)
+            save_efl_qa_for_student(sid, rec)
+            st.toast("Quick Assessment saved.")
+            st.rerun()
+    with dl_col:
+        st.download_button(
+            "📄 Download QA PDF",
+            data=build_efl_qa_pdf(s, pdf_rec),
+            file_name=(
+                f"efl_quick_assessment_"
+                f"{(s.get('name','') or 'learner').replace(' ', '_')}"
+                f"_{date.today().isoformat()}.pdf"
+            ),
+            mime="application/pdf",
+            width="stretch",
+            key=f"efl_qa_pdf_{sid}",
+        )
+
+
+# ── EFL Complete Assessment ───────────────────────────────────────────────────
+# Full EFL skill inventory organized by domain. Each skill row carries five
+# status buttons: MM (Marked Mastered, user), QA (auto — flagged by a Quick
+# Assessment answer), ID (user — identify for further assessment), N/A (user —
+# not applicable), IA (auto — teaching has started). MM/ID/N/A are persisted
+# per student; QA/IA are derived at render time.
+EFL_COMPLETE_FILE = os.path.join(DATA_DIR, "efl_complete.json")
+
+# Display order of the status buttons. ``auto`` buttons are read-only.
+EFL_COMPLETE_BUTTONS = [
+    {"key": "mm", "label": "MM", "auto": False,
+     "help": "Marked Mastered — mark this skill as mastered."},
+    {"key": "qa", "label": "QA", "auto": True,
+     "help": "Highlighted when a Quick Assessment answer flags this skill as "
+             "possibly needing further assessment."},
+    {"key": "id", "label": "ID", "auto": False,
+     "help": "Identify this skill for further assessment."},
+    {"key": "na", "label": "N/A", "auto": False,
+     "help": "Mark this skill as not applicable to this learner."},
+    {"key": "ia", "label": "IA", "auto": True,
+     "help": "Auto-selected when skill teaching has started."},
+]
+EFL_COMPLETE_USER_KEYS = [b["key"] for b in EFL_COMPLETE_BUTTONS if not b["auto"]]
+
+# Domains and their skills. Codes preserved exactly as on the EFL form
+# (note intentional gaps, e.g. R5 is omitted). More domains appended as added.
+EFL_COMPLETE_DOMAINS = [
+    {"code": "D1", "name": "Requests and Related Listener Responses",
+     "prefix": "R", "items": [
+         ("R 1", "Determining Learner Interests"),
+         ("R 2", "Indicates Interest in Items & Activities From R1"),
+         ("R 3", "Indicates Interest in Items & Activities from R2"),
+         ("R 4", "Instructs the Learner to Mand for Items & Activities from R3"),
+         ("R 6", "Determining Preferred Items & Activities"),
+         ("R 7", "Requests Highly Preferred Items or Activities Frequently "
+                 "Available"),
+         ("R 8", "Requests to Entertain Themselves or Reduce Anxiety"),
+         ("R 9", "Waits After Making Request for Items in R7 and R8"),
+         ("R 10", "Accepts Removal of 10 Items or Activities from R7 & R8 by "
+                  "Person in Authority"),
+         ("R 11", "Completes 10 Consecutive, Brief, Previously Acquired Tasks"),
+         ("R 12", "Shares or Takes Turns with Items and Activities in R7 and R8"),
+         ("R 13", "Transitions from Preferred Items & Activities to Required "
+                  "Tasks"),
+         ("R 14", "Requests Removal of or Less Intensity of 1-4 Situations"),
+         ("R 15", "'Accepts No' After Requesting Item and Activities Often "
+                  "Honored"),
+         ("R 16", "'Accepts No' After Requesting Dangerous Items or Activities"),
+         ("R 17", "Requests Forcefully and Repeatedly for Someone to Stop"),
+         ("R 18", "Requests Help In a Threatening or Dangerous Situation"),
+         ("R 19", "Requests Audience and Item or Activity in R7 and R8"),
+         ("R 20", "Requests Communication Board, Book, or Device"),
+         ("R 21", "Politely Refuses Access to Preferred Items or Activities"),
+     ]},
+    {"code": "D2", "name": "Listener Responses, Names and Description",
+     "prefix": "LR, LRND", "items": [
+         ("LR 1", "Holds and Maintains Contact with Someone's Hand When "
+                  "Directed"),
+         ("LR 2", "Moves Toward and Stands or Sits Next to Someone when "
+                  "Directed"),
+         ("LR 3", "Moves Toward and Stand or Remains in Line When Directed"),
+         ("LR 4", "Waits Within Arms Length of Someone or Waits in Line when "
+                  "Directed"),
+         ("LR 5", "Stands Up, Sits Down, Folds Hands, etc. when Directed"),
+         ("LR 6", "Moves From One Locations to Another when Directed"),
+         ("LR 7", "Waits at a Location when Directed"),
+         ("LR 8", "Moves to and Remains in Designated Area when Directed"),
+         ("LR 9", "Stops Moving or Engaging in a Dangerous Activity when "
+                  "Directed"),
+         ("LR 10", "Turns Toward Others when Name is Called and Makes Responses "
+                   "from LR1-9"),
+         ("LR 11", "Fastens Seat Belt and Remains in Seat Belt when Directed"),
+     ]},
+    {"code": "D4", "name": "Daily Living and Related Skills", "prefix": "DLS",
+     "items": [
+         ("DLS_EDF 1", "Consumes Thick or Thickened Liquids Orally"),
+         ("DLS_SLP 1", "Goes to Sleep at Bedtime"),
+         ("DLS_MT 1", "Transported with a Hoist (MR)"),
+         ("DLS_AHS 1", "Does not Pick up Knives, etc Without Supervision or "
+                       "Training"),
+         ("DLS_HS 1", "Performs Required Exercises or Therapeutic Activities "
+                      "(MR)"),
+         ("DLS_EDF 2", "Consumes Three Thin Liquids Orally, Including Water"),
+         ("DLS_SLP 2", "Sleeps Through the Night"),
+         ("DLS_MT 2", "Transports Self to Toilet (MR)"),
+         ("DLS_AHS 2", "Does not Take Medications Without Supervision or "
+                       "Training"),
+         ("DLS_HS 2", "Looks Both Ways, Waits for Traffic to Clear, Crosses "
+                      "Street quickly (MR)"),
+         ("DLS_EDF 3", "Consumes Three Soft Foods"),
+         ("DLS_MT 3", "Transports Self From Bed or Chair to Wheelchair or MOVE "
+                      "Device with a Return (MR)"),
+         ("DLS_AHS 3", "Does not Use Cleaning Fluids without Supervision or "
+                       "Training"),
+         ("DLS_HS 3", "Wears External Clothing Appropriate to Weather "
+                      "Conditions (MR)"),
+         ("DLS_EDF 4", "Chews Three Soft Foods"),
+         ("DLS_MT 4", "Transports Self From Bed or Chair to Walker or Gait "
+                      "Trainer with a Return (MR)"),
+         ("DLS_AHS 4", "Does not Touch Insecticides"),
+         ("DLS_HS 4", "Fastens and Remains in Seat Belt"),
+         ("DLS_EDF 5", "Munches Three Crunchy Foods"),
+         ("DLS_MT 5", "Transported in a Wheelchair"),
+         ("DLS_AHS 5", "Does not Walk After Dark Without Companion"),
+         ("DLS_HS 5", "Attends Medical Appointments"),
+         ("DLS_EDF 6", "Chews Three Crunchy Foods"),
+         ("DLS_AHS 6", "Does not Walk on Wet Floors"),
+         ("DLS_HS 6", "Attends Dental Appointments"),
+         ("DLS_EDF 7", "Chews Three Chewy Foods"),
+         ("DLS_AHS 7", "Does not Turn On Hot Water Before Cold Water"),
+         ("DLS_HS 7", "Attends Therapy Appointments"),
+         ("DLS_EDF 8", "Drinks with a Sippy Cup"),
+         ("DLS_AHS 8", "Does not Enter Pools, Lakes, etc. Without Supervision"),
+         ("DLS_HS 8", "Engages in Safe, Personal, Sexual Behavior in "
+                      "Appropriate Setting (MR)"),
+         ("DLS_EDF 9", "Drinks from a Cup or Glass"),
+         ("DLS_AHS 9", "Does not Touch Matches or Lighters"),
+         ("DLS_AHS 10", "Does not Plug In or Touch an Iron"),
+         ("DLS_AHS 11", "Does not Pick up Car Keys"),
+         ("DLS_AHS 12", "Does not Put Harmful Items in Their Mouth"),
+         ("DLS_AHS 13", "Does not Put Anything in Their Eyes, Ears, Rectum, "
+                        "etc."),
+         ("DLS_AHS 14", "Does not Go into or Across Street Without Supervision"),
+         ("DLS_AHS 15", "Does not Talk to, Walk with, Get in Car with or Open "
+                        "Door to Strangers"),
+     ]},
+    {"code": "D6", "name": "Tolerating Skills and Eggshells", "prefix": "T",
+     "items": [
+         ("T-BHI 1", "The Sight, Sound, or Scent of An Unfamiliar Person"),
+         ("T-EDF 1", "A Gastrostomy or Nasogastric Tube"),
+         ("T-DM 1", "Medication Hidden in Food"),
+         ("T-Slp 1", "Parent's Bed"),
+         ("T-Toil 1", "Someone Changing Your Diaper"),
+         ("T-PRM 1", "A Bed Chair"),
+         ("T-PTA 1", "Glasses or Contact Lenses"),
+         ("T-PEMR 1", "A Helmet"),
+         ("T-BPH 1", "Someone Washing Your Hands"),
+         ("T-DD 1", "Someone Brushing Your Teeth"),
+         ("T-BHI 2", "In the Same Room with An Unfamiliar Person"),
+         ("T-EDF 2", "A Feeding Pump"),
+         ("T-DM 2", "Liquid Medication from an Oral Syringe"),
+         ("T-Slp 2", "A Crib"),
+         ("T-Toil 2", "Potty Chair or Adapted Toilet"),
+         ("T-PRM 2", "A Side Lyer"),
+         ("T-PTA 2", "A Hearing Aide or Cochlear Implant"),
+         ("T-PEMR 2", "A Face Guard"),
+         ("T-BPH 2", "Someone Washing Your Face"),
+         ("T-BHI 3", "In Close Physical Proximity to An Unfamiliar Person"),
+         ("T-EDF 3", "Thickened Liquids"),
+         ("T-DM 3", "Liquid Medication from a Spoon"),
+         ("T-Slp 3", "Own Bed"),
+         ("T-Toil 3", "Toilet"),
+         ("T-PRM 3", "A Corner Chair"),
+         ("T-PTA 3", "A Wheelchair"),
+         ("T-PEMR 3", "Padded Arm Guards"),
+         ("T-BPH 3", "Someone Washing Your Ears"),
+         ("T-BHI 4", "Demonstration Prompts"),
+         ("T-EDF 4", "Liquids"),
+         ("T-DM 4", "Pill or Vitamins"),
+         ("T-Slp 4", "Pajamas"),
+         ("T-Toil 4", "Catheter"),
+         ("T-PRM 4", "A Prone to Supine Stander"),
+         ("T-PTA 4", "A Gait Trainer"),
+         ("T-PEMR 4", "Padded Gloves or Mitts"),
+         ("T-BPH 4", "Someone Shampooing Your Hair"),
+         ("T-BHI 5", "Touch, Physical Guidance, or Physical Prompts"),
+         ("T-EDF 5", "Baby Food"),
+         ("T-DM 5", "Oxygen from a Nasal Tube"),
+         ("T-Slp 5", "Light's Off"),
+         ("T-Toil 5", "A Colostomy or Ileostomy Bag"),
+         ("T-PRM 5", "An Adapted Chair"),
+         ("T-PTA 5", "A Walker"),
+         ("T-PEMR 5", "Finger Cots"),
+         ("T-BPH 5", "Someone Brushing or Combing Your Hair"),
+         ("T-EDF 6", "Pureed Foods"),
+         ("T-DM 6", "An Inhaler"),
+         ("T-PRM 6", "Range of Motion Exercises"),
+         ("T-PTA 6", "A Seat Belt"),
+         ("T-PEMR 6", "Knee or Elbow Pads"),
+         ("T-BPH 6", "A Sponge Bath"),
+         ("T-EDF 7", "Soft Foods"),
+         ("T-DM 7", "Testing Blood by Pricking a Finger"),
+         ("T-PTA 7", "A MOVE Device"),
+         ("T-PEMR 7", "A Jumpsuit"),
+         ("T-BPH 7", "A Tub Bath"),
+         ("T-EDF 8", "Mashed Foods"),
+         ("T-DM 8", "Insulin Injection"),
+         ("T-PTA 8", "A Helmet"),
+         ("T-PEMR 8", "A Posey Vest"),
+         ("T-BPH 8", "A Hoist"),
+         ("T-EDF 9", "An Adapted Spoon"),
+         ("T-DM 9", "Ventilation and Suction"),
+         ("T-PTA 9", "AFOs"),
+         ("T-PEMR 9", "Arm Splints"),
+         ("T-EDF 10", "An Adapted Cup, Bowl, or Plate"),
+         ("T-PTA 10", "Splints"),
+         ("T-PEMR 10", "A Mat Wrap or Restraint Board"),
+         ("T-EDF 11", "Solid Foods"),
+         ("T-PTA 11", "Braces"),
+     ]},
+]
+
+# code -> truthy condition for the QA auto-highlight. Filled in later once the
+# Quick-Assessment-to-skill mapping rules are provided.
+EFL_COMPLETE_QA_FLAGS: dict[str, bool] = {}
+
+
+def load_efl_complete() -> list[dict[str, Any]]:
+    return _load(EFL_COMPLETE_FILE)
+
+
+def save_efl_complete(rows): _save(EFL_COMPLETE_FILE, rows)
+
+
+def efl_complete_for_student(student_id: str) -> dict:
+    rows = load_efl_complete()
+    rec = next((r for r in rows if r.get("student_id") == student_id), None)
+    if rec is None:
+        rec = {"student_id": student_id}
+    rec.setdefault("skills", {})
+    return rec
+
+
+def save_efl_complete_for_student(student_id: str, record: dict) -> None:
+    rows = load_efl_complete()
+    for i, r in enumerate(rows):
+        if r.get("student_id") == student_id:
+            rows[i] = record
+            break
+    else:
+        rows.append(record)
+    save_efl_complete(rows)
+
+
+def _efl_complete_qa_flag(sid: str, code: str) -> bool:
+    """Whether the QA auto-highlight is on for this skill (mapping TBD)."""
+    return bool(EFL_COMPLETE_QA_FLAGS.get(code))
+
+
+def _efl_complete_ia_flag(sid: str, code: str, all_targets: list) -> bool:
+    """IA (teaching started) — true if any of the learner's targets is linked
+    to this EFL skill code."""
+    return any(
+        t.get("student_id") == sid and t.get("efl_skill_code") == code
+        for t in all_targets
+    )
+
+
+def _efl_complete_auto(sid: str, code: str, all_targets: list) -> dict:
+    return {
+        "qa": _efl_complete_qa_flag(sid, code),
+        "ia": _efl_complete_ia_flag(sid, code, all_targets),
+    }
+
+
+def build_efl_complete_pdf(student: dict, sid: str, flags: dict) -> bytes:
+    name = student.get("name", "")
+    pdf = _pdf_init(f"EFL Complete Assessment · {name}")
+    avail = pdf.w - pdf.l_margin - pdf.r_margin
+    all_targets = load_targets()
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(28, 25, 23)
+    pdf.cell(0, 7, "THE ESSENTIAL FOR LIVING COMPLETE ASSESSMENT",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+    _pdf_kv_row(pdf, "Learner", name or "-")
+    _pdf_kv_row(pdf, "Generated", _fmt_date(date.today().isoformat()))
+    pdf.set_font("Helvetica", "I", 7.5)
+    pdf.set_text_color(120, 113, 108)
+    pdf.cell(0, 4.2,
+             "MM Marked Mastered · QA flagged by Quick Assessment · "
+             "ID identify for assessment · N/A not applicable · IA teaching "
+             "started", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1.5)
+
+    cell_w, gap, box_h = 9.5, 1.6, 5.4
+    n = len(EFL_COMPLETE_BUTTONS)
+    cells_w = n * cell_w + (n - 1) * gap
+    label_w = avail - cells_w
+
+    for domain in EFL_COMPLETE_DOMAINS:
+        if pdf.get_y() + 10 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.set_text_color(122, 30, 40)
+        pdf.multi_cell(avail, 5,
+                       _pdf_safe(f"{domain['code']} — {domain['name']} "
+                                 f"({domain['prefix']})"))
+        # Column headers above the button cells.
+        y = pdf.get_y()
+        pdf.set_font("Helvetica", "B", 6.5)
+        pdf.set_text_color(120, 113, 108)
+        x = pdf.l_margin + label_w
+        for btn in EFL_COMPLETE_BUTTONS:
+            pdf.set_xy(x, y)
+            pdf.cell(cell_w, 3.4, btn["label"], align="C")
+            x += cell_w + gap
+        pdf.set_y(y + 3.8)
+
+        for code, desc in domain["items"]:
+            if pdf.get_y() + box_h + 1 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            cur = flags.get(code, {})
+            auto = _efl_complete_auto(sid, code, all_targets)
+            y = pdf.get_y()
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(28, 25, 23)
+            pdf.set_xy(pdf.l_margin, y)
+            pdf.multi_cell(label_w - 1, box_h, _pdf_safe(f"{code}  {desc}"),
+                           max_line_height=2.7)
+            row_end_y = pdf.get_y()
+            x = pdf.l_margin + label_w
+            for btn in EFL_COMPLETE_BUTTONS:
+                k = btn["key"]
+                on = auto.get(k, False) if btn["auto"] else bool(cur.get(k))
+                if on:
+                    pdf.set_fill_color(37, 99, 235)
+                    pdf.set_draw_color(37, 99, 235)
+                    pdf.rect(x, y + 0.2, cell_w, box_h - 0.4, style="DF")
+                    pdf.set_text_color(255, 255, 255)
+                    pdf.set_font("Helvetica", "B", 6.5)
+                else:
+                    pdf.set_draw_color(185, 185, 185)
+                    pdf.rect(x, y + 0.2, cell_w, box_h - 0.4, style="D")
+                    pdf.set_text_color(150, 150, 150)
+                    pdf.set_font("Helvetica", "", 6.5)
+                pdf.set_xy(x, y + 0.2)
+                pdf.cell(cell_w, box_h - 0.4, btn["label"], align="C")
+                x += cell_w + gap
+            pdf.set_y(max(y + box_h, row_end_y) + 0.8)
+
+    return _pdf_bytes(pdf)
+
+
+def _efl_complete_section(sid: str, s: dict) -> None:
+    """Interactive EFL Complete Assessment (skills by domain), per student."""
+    st.divider()
+    st.subheader("Complete Assessment")
+    if not EFL_COMPLETE_DOMAINS:
+        st.info("No Complete Assessment domains defined yet.")
+        return
+    st.caption(
+        "Full EFL skill inventory by domain. **MM** mark mastered · **QA** "
+        "(auto) flagged by the Quick Assessment · **ID** identify for further "
+        "assessment · **N/A** not applicable · **IA** (auto) teaching started. "
+        "Hover a button for details. Click **Save** when done."
+    )
+
+    rec = efl_complete_for_student(sid)
+    ss_key = f"_efl_complete_flags_{sid}"
+    if ss_key not in st.session_state:
+        st.session_state[ss_key] = {
+            c: dict(v) for c, v in rec.get("skills", {}).items()
+        }
+    flags = st.session_state[ss_key]
+    all_targets = load_targets()
+
+    dom_codes = [d["code"] for d in EFL_COMPLETE_DOMAINS]
+    dom_by_code = {d["code"]: d for d in EFL_COMPLETE_DOMAINS}
+    dom = st.selectbox(
+        "Domain", options=dom_codes,
+        format_func=lambda c: f"{c} — {dom_by_code[c]['name']} "
+                              f"({dom_by_code[c]['prefix']})",
+        key=f"efl_cmp_dom_{sid}",
+    )
+    domain = dom_by_code[dom]
+
+    for code, desc in domain["items"]:
+        cur = flags.setdefault(code, {})
+        cols = st.columns([0.50, 0.10, 0.10, 0.10, 0.10, 0.10])
+        cols[0].markdown(f"**{code}** · {desc}")
+        auto = _efl_complete_auto(sid, code, all_targets)
+        for i, btn in enumerate(EFL_COMPLETE_BUTTONS):
+            k = btn["key"]
+            with cols[i + 1]:
+                if btn["auto"]:
+                    on = auto.get(k, False)
+                    st.button(
+                        btn["label"], key=f"efl_cmp_{sid}_{code}_{k}",
+                        type="primary" if on else "secondary",
+                        disabled=True, width="stretch", help=btn["help"],
+                    )
+                else:
+                    on = bool(cur.get(k))
+                    if st.button(
+                        btn["label"], key=f"efl_cmp_{sid}_{code}_{k}",
+                        type="primary" if on else "secondary",
+                        width="stretch", help=btn["help"],
+                    ):
+                        cur[k] = not on
+                        st.rerun()
+
+    # Per-domain progress.
+    dom_codes_set = {c for c, _ in domain["items"]}
+    marked = sum(
+        1 for c in dom_codes_set
+        if any(flags.get(c, {}).get(k) for k in EFL_COMPLETE_USER_KEYS)
+    )
+    st.caption(f"{marked} / {len(dom_codes_set)} skills marked in **{dom}**.")
+
+    save_col, dl_col = st.columns(2)
+    with save_col:
+        if st.button(
+            "💾 Save Complete Assessment", type="primary", width="stretch",
+            key=f"efl_cmp_save_{sid}",
+        ):
+            rec["skills"] = {
+                c: {k: True for k in EFL_COMPLETE_USER_KEYS if v.get(k)}
+                for c, v in flags.items()
+                if any(v.get(k) for k in EFL_COMPLETE_USER_KEYS)
+            }
+            save_efl_complete_for_student(sid, rec)
+            st.toast("Complete Assessment saved.")
+            st.rerun()
+    with dl_col:
+        st.download_button(
+            "📄 Download Complete Assessment PDF",
+            data=build_efl_complete_pdf(s, sid, flags),
+            file_name=(
+                f"efl_complete_assessment_"
+                f"{(s.get('name','') or 'learner').replace(' ', '_')}"
+                f"_{date.today().isoformat()}.pdf"
+            ),
+            mime="application/pdf",
+            width="stretch",
+            key=f"efl_cmp_pdf_{sid}",
+        )
+
+
 def page_efl_assessment():
     students = load_students()
     if not students:
@@ -6937,6 +9962,8 @@ def page_efl_assessment():
         "starting with the 8 Must-Have skills. Pick a status for each skill on up "
         "to four test administrations and record the date and tester for each."
     )
+
+    _efl_must_have_overview()
 
     rec = efl_for_student(sid)
     ever = st.session_state.get("efl_ver", 0)
@@ -7344,6 +10371,12 @@ def page_efl_assessment():
         )
         st.toast("EFL assessment saved.")
         st.rerun()
+
+    # ── Quick Assessment (separate persisted record) ────────────────────────
+    _efl_qa_section(sid, s)
+
+    # ── Complete Assessment (separate persisted record) ─────────────────────
+    _efl_complete_section(sid, s)
 
 
 # ── VB-MAPP Milestones Assessment ─────────────────────────────────────────────
@@ -7866,6 +10899,7 @@ def main():
         ("Student Home", "🏠"),
         ("Dashboard", "🗂"),
         ("Target Bank", "🏦"),
+        ("Intervention Bank", "🧩"),
         ("Export", "📤"),
     ]
     page_names = [name for name, _ in pages]
@@ -7896,6 +10930,7 @@ def main():
         "Student Home": page_home,
         "Dashboard": page_student_dashboard,
         "Target Bank": page_target_bank,
+        "Intervention Bank": page_intervention_bank,
         "EFL Assessment": page_efl_assessment,
         "VB-MAPP Assessment": page_vbmapp_assessment,
         "Collect Cold Probe Data": page_probe_entry,
