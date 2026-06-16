@@ -12,3 +12,13 @@ __pycache__/
 *.pyc
 *.tmp
 .streamlit/secrets.toml
+
+# Desktop-app build artifacts
+dist/
+build/
+build_iconset/
+AppIcon.icns
+
+# ...but DO track the source icon (the repo root ignores *.png); the build
+# regenerates AppIcon.icns from it.
+!icon-1024.png
