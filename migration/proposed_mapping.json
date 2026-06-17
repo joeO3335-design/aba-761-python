@@ -1,0 +1,44 @@
+[
+  {
+    "fba_name": "Christian Arias",
+    "status": "fuzzy",
+    "match_score": 0.7,
+    "reason": "first name + last initial match — CONFIRM by hand",
+    "footprint": {
+      "profile": true,
+      "abc_entries": 3,
+      "indirect_assessment": false
+    },
+    "repertiores_student_id": "7a407fce",
+    "repertiores_name": "Christian A",
+    "action": "map"
+  },
+  {
+    "fba_name": "Joe Ott",
+    "status": "none",
+    "match_score": 0.0,
+    "reason": "no Repertiores learner matches — needs new student or skip",
+    "footprint": {
+      "profile": true,
+      "abc_entries": 6,
+      "indirect_assessment": true
+    },
+    "repertiores_student_id": null,
+    "repertiores_name": null,
+    "action": "skip"
+  },
+  {
+    "fba_name": "Freddie Mercury",
+    "status": "none",
+    "match_score": 0.0,
+    "reason": "no Repertiores learner matches — needs new student or skip",
+    "footprint": {
+      "profile": false,
+      "abc_entries": 1,
+      "indirect_assessment": false
+    },
+    "repertiores_student_id": null,
+    "repertiores_name": null,
+    "action": "skip"
+  }
+]

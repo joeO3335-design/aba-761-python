@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import shutil
 from datetime import date, datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as _go
@@ -17,6 +18,7 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
+
 # ── Dev mode — set to False before deploying ─────────────────────────────────
 DEV_MODE = True
 
@@ -24,10 +26,171 @@ DEV_MODE = True
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DATA_FILE      = os.path.join(DATA_DIR, "abc_entries.json")
 STUDENTS_FILE  = os.path.join(DATA_DIR, "students.json")
+PROFILES_FILE  = os.path.join(DATA_DIR, "student_profiles.json")
+ARCHIVE_FILE   = os.path.join(DATA_DIR, "archived_students.json")
 CATEGORIES_FILE= os.path.join(DATA_DIR, "categories.json")
 USERS_FILE     = os.path.join(DATA_DIR, "users.json")
 AUDIT_FILE     = os.path.join(DATA_DIR, "audit_log.json")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ── Data safety: atomic writes + rolling backups + corruption recovery ───────
+# Ported from Repertiores so FBA's clinical data has the same protection: every
+# save is atomic (temp file + os.replace) and snapshots the last-good copy; a
+# corrupt file is recovered from the newest backup rather than silently lost.
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+AUTO_BACKUPS_DIR = os.path.join(BACKUPS_DIR, "auto")
+os.makedirs(AUTO_BACKUPS_DIR, exist_ok=True)
+MAX_AUTO_BACKUPS = 15
+
+# Files whose on-disk copy failed to parse and could not be recovered. Saving to
+# these is blocked so a corrupt file is never overwritten with empty data.
+_QUARANTINED: set = set()
+# path -> human-readable message about a load problem, surfaced as a banner.
+_LOAD_ERRORS: dict = {}
+
+
+def _backup_file(path: str) -> None:
+    """Copy ``path`` into the auto-backup folder, pruning to MAX_AUTO_BACKUPS.
+    Called after each successful write. Failures are non-fatal — a backup miss
+    must never block the actual save."""
+    if not os.path.exists(path):
+        return
+    stem = os.path.splitext(os.path.basename(path))[0]
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    try:
+        shutil.copy2(path, os.path.join(AUTO_BACKUPS_DIR, f"{stem}.{ts}.json"))
+    except Exception:
+        return
+    prefix = stem + "."
+    backups = sorted(
+        f for f in os.listdir(AUTO_BACKUPS_DIR)
+        if f.startswith(prefix) and f.endswith(".json")
+    )
+    while len(backups) > MAX_AUTO_BACKUPS:
+        try:
+            os.remove(os.path.join(AUTO_BACKUPS_DIR, backups.pop(0)))
+        except Exception:
+            break
+
+
+def _recover_or_quarantine(path: str, err: Exception, default):
+    """Handle a data file that exists but won't parse: preserve the corrupt copy,
+    recover the newest parseable backup, else quarantine the path so _safe_save
+    refuses to overwrite it. Returns recovered data, or ``default`` if none."""
+    name = os.path.basename(path)
+    stem = os.path.splitext(name)[0]
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    msg = getattr(err, "msg", str(err))
+    try:
+        shutil.copy2(path, os.path.join(AUTO_BACKUPS_DIR, f"{stem}.{ts}.corrupt"))
+    except Exception:
+        pass
+    candidates = []
+    for d in (AUTO_BACKUPS_DIR, BACKUPS_DIR):
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.startswith(stem + ".") and f.endswith(".json"):
+                fp = os.path.join(d, f)
+                try:
+                    candidates.append((os.path.getmtime(fp), fp))
+                except Exception:
+                    pass
+    for _, fp in sorted(candidates, reverse=True):
+        try:
+            with open(fp) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        _QUARANTINED.discard(path)
+        _LOAD_ERRORS[path] = (
+            f"was unreadable ({msg}); recovered from backup {os.path.basename(fp)}. "
+            f"The corrupt copy was saved as {stem}.{ts}.corrupt in data/backups/auto/."
+        )
+        return data
+    _QUARANTINED.add(path)
+    _LOAD_ERRORS[path] = (
+        f"is corrupt ({msg}) and no usable backup was found. Saving to this file "
+        f"is blocked to prevent data loss; the corrupt copy is preserved as "
+        f"{stem}.{ts}.corrupt in data/backups/auto/."
+    )
+    return default
+
+
+def _safe_load(path: str, default):
+    """Load JSON from ``path`` with corruption recovery. Returns ``default`` if
+    the file is missing, or recovers/quarantines if it exists but won't parse."""
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        # Do NOT silently return default — a later save would overwrite
+        # recoverable data with nothing.
+        return _recover_or_quarantine(path, e, default)
+    _QUARANTINED.discard(path)
+    _LOAD_ERRORS.pop(path, None)
+    return data
+
+
+def _safe_save(path: str, data) -> None:
+    """Atomically write ``data`` to ``path`` (temp file + os.replace), then
+    snapshot the committed copy. Refuses to write a quarantined file."""
+    if path in _QUARANTINED:
+        raise RuntimeError(
+            f"Refusing to write {os.path.basename(path)}: its on-disk copy is "
+            f"corrupt and no backup was found. Fix or remove the corrupt file in "
+            f"data/ first (the corrupt copy is in data/backups/auto/)."
+        )
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic on the same filesystem
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+    _backup_file(path)  # snapshot the committed (last-good) state
+
+# ── Repertiores roster bridge ────────────────────────────────────────────────
+# FBA shares its learner roster with Repertiores: the same person carries the
+# same 8-char student_id across both apps. FBA keys its own records by the
+# Repertiores DISPLAY NAME (so its name-based UI is unchanged), but every record
+# is stamped with student_id for the robust cross-app link (Phase 3 handoff).
+def _repertiores_data_dir() -> str:
+    """Locate Repertiores' data dir (live app-support copy, else workspace copy)."""
+    env = os.environ.get("REPERTIORES_DATA_DIR")
+    if env and os.path.exists(os.path.join(env, "students.json")):
+        return env
+    live = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
+                        "Repertiores", "data")
+    if os.path.exists(os.path.join(live, "students.json")):
+        return live
+    ws = os.path.join(os.path.dirname(__file__), "..", "Repertiores", "data")
+    return ws
+
+REPERTIORES_STUDENTS_FILE = os.path.join(_repertiores_data_dir(), "students.json")
+
+def load_roster() -> list:
+    """Repertiores learners as [{'id','name',...}] — the shared source of truth."""
+    data = _safe_load(REPERTIORES_STUDENTS_FILE, [])
+    return data if isinstance(data, list) else []
+
+def roster_id_for_name(name: str):
+    """Resolve a display name to its Repertiores student_id, or None."""
+    if not name:
+        return None
+    for s in load_roster():
+        if s.get("name") == name:
+            return s.get("id")
+    return None
 
 # ── HIPAA: Session timeout (minutes) ─────────────────────────────────────────
 SESSION_TIMEOUT_MIN = 20
@@ -40,8 +203,7 @@ def _hash_password(password: str) -> str:
 
 def load_users() -> dict:
     if os.path.exists(USERS_FILE):
-        with open(USERS_FILE) as f:
-            return json.load(f)
+        return _safe_load(USERS_FILE, {})
     # Default admin account — password 'Admin123!' (hash stored, never plain text)
     default = {
         "admin": {
@@ -50,8 +212,7 @@ def load_users() -> dict:
             "role": "admin",
         }
     }
-    with open(USERS_FILE, "w") as f:
-        json.dump(default, f, indent=2)
+    _safe_save(USERS_FILE, default)
     return default
 
 def verify_user(username: str, password: str):
@@ -72,16 +233,9 @@ def audit_log(action: str, detail: str = ""):
         "action": action,
         "detail": detail,
     }
-    logs = []
-    if os.path.exists(AUDIT_FILE):
-        try:
-            with open(AUDIT_FILE) as f:
-                logs = json.load(f)
-        except Exception:
-            logs = []
+    logs = _safe_load(AUDIT_FILE, [])
     logs.append(entry)
-    with open(AUDIT_FILE, "w") as f:
-        json.dump(logs, f, indent=2, default=str)
+    _safe_save(AUDIT_FILE, logs)
 
 # ── HIPAA: Session activity tracking ─────────────────────────────────────────
 def touch_session():
@@ -156,12 +310,44 @@ CONSEQUENCES = [
     "Other",
 ]
 
+# ── Motivating Operations defaults ────────────────────────────────────────────
+MO_DEFAULTS = {
+    "Biological / Physical": [
+        {"key": "sleep_deprived",       "label": "Student arrived appearing drowsy — yawning, heavy eyelids, slow movement",         "tier": 2, "auto_field": None},
+        {"key": "illness_pain",         "label": "Student visited nurse today or verbally reported discomfort / observable guarding", "tier": 2, "auto_field": None},
+        {"key": "gi_issues",            "label": "Student showing signs of GI distress — reported stomachache, vomiting, or diarrhea observed / reported", "tier": 2, "auto_field": None},
+        {"key": "hunger",               "label": "Behavior occurring before scheduled meal or snack / student requesting food",       "tier": 2, "auto_field": None},
+        {"key": "fatigue",              "label": "High-demand activity immediately preceded this session",                           "tier": 2, "auto_field": None},
+        {"key": "medication_change",    "label": "Medication changed, missed, or new dose today",                                    "tier": 2, "auto_field": None},
+        {"key": "sensory_over",         "label": "Environment noisier, brighter, or more crowded than typical",                     "tier": 2, "auto_field": None},
+        {"key": "sensory_under",        "label": "Unstructured / free time with low sensory input — minimal activity in environment","tier": 1, "auto_field": "activity"},
+    ],
+    "Social / Emotional": [
+        {"key": "social_deprivation",   "label": "Less than typical adult interaction before session / preferred person absent",     "tier": 2, "auto_field": None},
+        {"key": "social_satiation",     "label": "Group larger than typical or high-interaction period immediately preceded session","tier": 2, "auto_field": None},
+        {"key": "preferred_person_absent", "label": "Named preferred staff member or peer not present today",                       "tier": 2, "auto_field": None},
+        {"key": "recent_conflict",      "label": "Significant negative social interaction occurred before this session",            "tier": 3, "auto_field": None},
+    ],
+    "Environmental / Contextual": [
+        {"key": "schedule_change",      "label": "Schedule changed or disrupted from posted routine",                               "tier": 2, "auto_field": None},
+        {"key": "transition",           "label": "Transition from preferred to non-preferred activity",                             "tier": 1, "auto_field": "antecedent"},
+        {"key": "item_removed",         "label": "Preferred item or activity removed within last 30 minutes",                       "tier": 2, "auto_field": None},
+        {"key": "item_unavailable",     "label": "Preferred item/activity requested and denied before session",                     "tier": 2, "auto_field": None},
+        {"key": "unfamiliar_person",    "label": "Unfamiliar adult or peer present in environment",                                 "tier": 3, "auto_field": None},
+        {"key": "novel_environment",    "label": "Setting is unfamiliar to student",                                               "tier": 3, "auto_field": None},
+    ],
+    "Task / Instructional": [
+        {"key": "high_demand",          "label": "High task difficulty or low perceived chance of success",                         "tier": 1, "auto_field": "antecedent"},
+        {"key": "long_task",            "label": "Long task duration — extended work period without break",                         "tier": 2, "auto_field": None},
+        {"key": "low_choice",           "label": "Low perceived control or choice in current activity",                             "tier": 2, "auto_field": None},
+        {"key": "nonpreferred_task",    "label": "Non-preferred subject or activity currently assigned",                            "tier": 2, "auto_field": None},
+        {"key": "independent_work",     "label": "Expected to work independently with little support",                              "tier": 1, "auto_field": "instructional_format"},
+    ],
+}
+
 # ── Category loader (custom overrides defaults) ───────────────────────────────
 def load_categories():
-    if os.path.exists(CATEGORIES_FILE):
-        saved = json.load(open(CATEGORIES_FILE))
-    else:
-        saved = {}
+    saved = _safe_load(CATEGORIES_FILE, {})
     return {
         "behaviors":             saved.get("behaviors",             BEHAVIORS),
         "behavior_abbrevs":      saved.get("behavior_abbrevs",      BEHAVIOR_ABBREVS_DEFAULT),
@@ -172,11 +358,11 @@ def load_categories():
         "subjects":              saved.get("subjects",              SUBJECTS),
         "activities":            saved.get("activities",            ACTIVITIES),
         "instructional_formats": saved.get("instructional_formats", INSTRUCTIONAL_FORMATS),
+        "custom_mos":            saved.get("custom_mos",            []),
     }
 
 def save_categories(cats):
-    with open(CATEGORIES_FILE, "w") as f:
-        json.dump(cats, f, indent=2)
+    _safe_save(CATEGORIES_FILE, cats)
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
@@ -190,7 +376,7 @@ CSS = """
 .block-container {
     padding-top: 0 !important;
     padding-bottom: 2rem !important;
-    max-width: 900px !important;
+    max-width: 100% !important;
 }
 
 html, body, [class*="css"] {
@@ -418,14 +604,24 @@ table tbody td { padding: 12px 12px; vertical-align: middle; }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_json(path):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return []
+    return _safe_load(path, [])
 
 def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+    _safe_save(path, data)
+
+def load_profiles() -> dict:
+    """Load student profiles dict keyed by student name."""
+    return _safe_load(PROFILES_FILE, {})
+
+def save_profiles(profiles: dict):
+    _safe_save(PROFILES_FILE, profiles)
+
+def load_archive() -> list:
+    """Load list of archived student records [{name, archived_date, entry_count}]."""
+    return _safe_load(ARCHIVE_FILE, [])
+
+def save_archive(archive: list):
+    _safe_save(ARCHIVE_FILE, archive)
 
 def duration_from_seconds(s):
     if not s: return None
@@ -523,6 +719,79 @@ def page_login():
             else:
                 audit_log("LOGIN_FAIL", f"Failed login attempt for {email.strip()}")
                 st.error("Invalid username or password.")
+
+        # ── Create account toggle ─────────────────────────────────────────────
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        st.markdown("""
+        <style>
+        div[data-testid="stButton"]:has(button[data-testid="show_register_btn"]) button {
+            background: transparent !important;
+            color: #6b7280 !important;
+            border: 1.5px solid #e5e7eb !important;
+            border-radius: 10px !important;
+            font-size: 13px !important;
+            font-weight: 600 !important;
+            height: 40px !important;
+        }
+        div[data-testid="stButton"]:has(button[data-testid="show_register_btn"]) button:hover {
+            border-color: #16a34a !important;
+            color: #15803d !important;
+            background: #f0fdf4 !important;
+        }
+        </style>""", unsafe_allow_html=True)
+        if st.button("＋ Create new account", use_container_width=True, key="show_register_btn"):
+            st.session_state["show_register"] = not st.session_state.get("show_register", False)
+            st.rerun()
+
+        if st.session_state.get("show_register"):
+            st.markdown(
+                '<div style="background:#f0fdf4;border:1.5px solid #86efac;'
+                'border-radius:14px;padding:20px 20px 16px 20px;margin-top:8px;">',
+                unsafe_allow_html=True
+            )
+            st.markdown("**Create Account**")
+            reg_name = st.text_input("Full Name", placeholder="Your full name", key="reg_name")
+            reg_user = st.text_input("Username", placeholder="Choose a username", key="reg_user")
+            reg_pw   = st.text_input("Password", type="password",
+                                     placeholder="Min 8 characters", key="reg_pw")
+            reg_pw2  = st.text_input("Confirm Password", type="password",
+                                     placeholder="Re-enter password", key="reg_pw2")
+
+            if st.button("Create Account", type="primary", use_container_width=True,
+                         key="register_submit_btn"):
+                errs = []
+                if not reg_name.strip():
+                    errs.append("Full name is required.")
+                if not reg_user.strip():
+                    errs.append("Username is required.")
+                elif len(reg_user.strip()) < 3:
+                    errs.append("Username must be at least 3 characters.")
+                if len(reg_pw) < 8:
+                    errs.append("Password must be at least 8 characters.")
+                if reg_pw != reg_pw2:
+                    errs.append("Passwords do not match.")
+                users = load_users()
+                if reg_user.strip().lower() in users:
+                    errs.append("That username is already taken.")
+                if errs:
+                    for e in errs:
+                        st.error(e)
+                else:
+                    users[reg_user.strip().lower()] = {
+                        "password_hash": _hash_password(reg_pw),
+                        "name": reg_name.strip(),
+                        "role": "observer",
+                    }
+                    _safe_save(USERS_FILE, users)
+                    audit_log("REGISTER", f"New account created: {reg_user.strip().lower()}")
+                    st.success(f"Account created! You can now sign in as **{reg_user.strip()}**.")
+                    st.session_state["show_register"] = False
+                    st.rerun()
+            if st.button("Cancel", use_container_width=True, key="cancel_register_btn"):
+                st.session_state["show_register"] = False
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
         st.markdown(
             '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;'
             'padding:10px 14px;margin-top:16px;font-size:11px;color:#92400e;line-height:1.5;">'
@@ -600,134 +869,561 @@ def page_student_selector():
 
     students = load_json(STUDENTS_FILE)
 
+    # ── Onboarding empty state ────────────────────────────────────────────────
+    if not students:
+        st.markdown(
+            '<div style="text-align:center;padding:40px 20px 32px 20px;">'
+            '<div style="font-size:48px;margin-bottom:16px;">🎒</div>'
+            '<div style="font-size:20px;font-weight:700;color:#111827;margin-bottom:8px;">'
+            'No students yet</div>'
+            '<div style="font-size:14px;color:#6b7280;max-width:320px;margin:0 auto 24px auto;">'
+            'Add your first student using the button below to start recording ABC observations.</div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
     # ── Student cards ─────────────────────────────────────────────────────────
-    # CSS: target the button that immediately follows a .student-card-marker div
-    # using the adjacent sibling combinator + :has(). Both are siblings in
-    # Streamlit's stVerticalBlock, so this reliably matches only student buttons.
+    profiles   = load_profiles()
+    all_entries_for_count = load_json(DATA_FILE)
+
+    # Avatar color palette — cycles through students
+    _AVATAR_COLORS = [
+        ("#dcfce7", "#16a34a"),  # green
+        ("#dbeafe", "#2563eb"),  # blue
+        ("#fce7f3", "#db2777"),  # pink
+        ("#fef9c3", "#ca8a04"),  # yellow
+        ("#ede9fe", "#7c3aed"),  # purple
+        ("#ffedd5", "#ea580c"),  # orange
+        ("#ccfbf1", "#0d9488"),  # teal
+    ]
+
     st.markdown("""
     <style>
-    .stMarkdown:has(.student-card-marker) + [data-testid="stButton"] > button {
-        background: white !important;
-        border: 1.5px solid #e5e7eb !important;
-        border-radius: 12px !important;
-        height: 60px !important;
-        text-align: left !important;
-        font-size: 16px !important;
-        font-weight: 600 !important;
-        color: #111827 !important;
-        justify-content: flex-start !important;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
-        padding: 0 18px !important;
+    .stu-card-visual {
+        background: white;
+        border: 1.5px solid #e5e7eb;
+        border-radius: 16px;
+        padding: 16px 16px 14px 16px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+        margin-bottom: 12px;
     }
-    .stMarkdown:has(.student-card-marker) + [data-testid="stButton"] > button:hover {
-        background: #f0fdf4 !important;
+    /* Each card lives in its own stColumn — scope to that */
+    [data-testid="stColumn"]:has(.stu-card-marker) {
+        position: relative !important;
+    }
+    [data-testid="stColumn"]:has(.stu-card-marker) [data-testid="stButton"] {
+        position: absolute !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        height: 140px !important;
+        z-index: 5 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    [data-testid="stColumn"]:has(.stu-card-marker) [data-testid="stButton"] > button {
+        opacity: 0 !important;
+        width: 100% !important;
+        height: 100% !important;
+        cursor: pointer !important;
+        border-radius: 16px !important;
+        padding: 0 !important;
+    }
+    /* Only highlight the card in the column whose button is hovered */
+    [data-testid="stColumn"]:has([data-testid="stButton"]:hover) .stu-card-visual {
         border-color: #16a34a !important;
-        color: #111827 !important;
+        box-shadow: 0 4px 16px rgba(22,163,74,0.14) !important;
+        background: #f0fdf4 !important;
     }
     </style>
     """, unsafe_allow_html=True)
 
-    for i, name in enumerate(students):
-        initial = name[0].upper()
-        av_col, btn_col = st.columns([1, 9])
-        with av_col:
-            st.markdown(
-                f'<div style="height:60px;display:flex;align-items:center;justify-content:center;">'
-                f'<div style="width:40px;height:40px;background:#dcfce7;border-radius:50%;'
-                f'display:flex;align-items:center;justify-content:center;'
-                f'color:#16a34a;font-weight:700;font-size:15px;">{initial}</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-        with btn_col:
-            # marker div → button are adjacent siblings → CSS :has() targets the button
-            st.markdown('<div class="student-card-marker"></div>', unsafe_allow_html=True)
-            if st.button(f"{name}   →", key=f"sel_{i}", use_container_width=True):
-                st.session_state.selected_student = name
-                st.rerun()
+    # Lay cards out in a 2-column grid
+    cols_per_row = 2
+    rows = [students[i:i+cols_per_row] for i in range(0, len(students), cols_per_row)]
+    for row_students in rows:
+        grid_cols = st.columns(cols_per_row)
+        for col, name in zip(grid_cols, row_students):
+            i = students.index(name)
+            bg, fg = _AVATAR_COLORS[i % len(_AVATAR_COLORS)]
+            initial = name[0].upper()
+            prof = profiles.get(name, {})
+            entry_count = len([e for e in all_entries_for_count if e.get("student_name") == name])
 
-    # ── Add new student (dashed card style) ───────────────────────────────────
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+            # Calculate age from DOB
+            age_str = ""
+            dob_raw = prof.get("dob", "")
+            if dob_raw:
+                for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%m/%d/%y"):
+                    try:
+                        dob_dt = datetime.strptime(dob_raw.strip(), fmt)
+                        today = date.today()
+                        age = today.year - dob_dt.year - ((today.month, today.day) < (dob_dt.month, dob_dt.day))
+                        age_str = f"Age {age}"
+                        break
+                    except Exception:
+                        pass
 
-    if not st.session_state.get("show_add_student"):
-        if st.button("＋  Add new student", use_container_width=True,
-                     key="show_add_btn"):
-            st.session_state.show_add_student = True
+            school_district = prof.get("school", "") or ""
+
+            # Build subtitle: name line info
+            subtitle_parts = []
+            if school_district:
+                subtitle_parts.append(school_district)
+            if age_str:
+                subtitle_parts.append(age_str)
+            subtitle = "  ·  ".join(subtitle_parts) if subtitle_parts else "No profile info yet"
+
+            # Bottom chips
+            chips_html = ""
+            for chip_val in [
+                age_str if age_str else None,
+                prof.get("grade"),
+                f"BCBA: {prof['case_manager']}" if prof.get("case_manager") else None,
+                prof.get("eligibility"),
+            ]:
+                if chip_val:
+                    chips_html += (
+                        f'<span style="background:#f3f4f6;border-radius:6px;padding:3px 8px;'
+                        f'font-size:11px;color:#374151;margin:2px 2px 2px 0;display:inline-block;">'
+                        f'{chip_val}</span>'
+                    )
+            if not chips_html:
+                chips_html = (
+                    '<span style="background:#fef9c3;color:#854d0e;border-radius:6px;'
+                    'padding:3px 8px;font-size:11px;display:inline-block;">✏️ Complete profile</span>'
+                )
+
+            with col:
+                st.markdown('<div class="stu-card-marker"></div>', unsafe_allow_html=True)
+                if st.button(" ", key=f"sel_{i}", use_container_width=True):
+                    st.session_state.selected_student = name
+                    st.rerun()
+                st.markdown(
+                    f'<div class="stu-card-visual">'
+                    f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">'
+                    f'  <div style="width:50px;height:50px;flex-shrink:0;background:{bg};border-radius:12px;'
+                    f'       display:flex;align-items:center;justify-content:center;'
+                    f'       color:{fg};font-weight:800;font-size:20px;">{initial}</div>'
+                    f'  <div style="flex:1;min-width:0;">'
+                    f'    <div style="font-size:15px;font-weight:700;color:#111827;">{name}</div>'
+                    f'    <div style="font-size:11px;color:#6b7280;margin-top:2px;'
+                    f'         overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{subtitle}</div>'
+                    f'  </div>'
+                    f'  <div style="text-align:center;flex-shrink:0;background:{bg};'
+                    f'       border-radius:10px;padding:5px 10px;">'
+                    f'    <div style="font-size:17px;font-weight:800;color:{fg};line-height:1;">{entry_count}</div>'
+                    f'    <div style="font-size:10px;color:{fg};opacity:0.8;">entr{"ies" if entry_count != 1 else "y"}</div>'
+                    f'  </div>'
+                    f'</div>'
+                    f'<div style="border-top:1px solid #f3f4f6;margin:0 0 8px 0;"></div>'
+                    f'<div>{chips_html}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+    # ── Action buttons row ────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    /* Add / Edit / Archive / Remove action buttons on selector page */
+    .stMarkdown:has(.action-btn-add) + [data-testid="stButton"] > button {
+        background: #f0fdf4 !important;
+        border: 2px solid #86efac !important;
+        border-radius: 12px !important;
+        height: 56px !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        color: #15803d !important;
+        box-shadow: 0 1px 4px rgba(22,163,74,0.10) !important;
+        transition: all 0.15s !important;
+    }
+    .stMarkdown:has(.action-btn-add) + [data-testid="stButton"] > button:hover {
+        background: #dcfce7 !important;
+        border-color: #16a34a !important;
+        box-shadow: 0 3px 10px rgba(22,163,74,0.18) !important;
+    }
+    .stMarkdown:has(.action-btn-edit) + [data-testid="stButton"] > button {
+        background: #eff6ff !important;
+        border: 2px solid #93c5fd !important;
+        border-radius: 12px !important;
+        height: 56px !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        color: #1d4ed8 !important;
+        box-shadow: 0 1px 4px rgba(59,130,246,0.10) !important;
+        transition: all 0.15s !important;
+    }
+    .stMarkdown:has(.action-btn-edit) + [data-testid="stButton"] > button:hover {
+        background: #dbeafe !important;
+        border-color: #3b82f6 !important;
+        box-shadow: 0 3px 10px rgba(59,130,246,0.18) !important;
+    }
+    .stMarkdown:has(.action-btn-archive) + [data-testid="stButton"] > button {
+        background: #faf5ff !important;
+        border: 2px solid #c4b5fd !important;
+        border-radius: 12px !important;
+        height: 56px !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        color: #6d28d9 !important;
+        box-shadow: 0 1px 4px rgba(109,40,217,0.10) !important;
+        transition: all 0.15s !important;
+    }
+    .stMarkdown:has(.action-btn-archive) + [data-testid="stButton"] > button:hover {
+        background: #ede9fe !important;
+        border-color: #7c3aed !important;
+        box-shadow: 0 3px 10px rgba(109,40,217,0.18) !important;
+    }
+    .stMarkdown:has(.action-btn-remove) + [data-testid="stButton"] > button {
+        background: #fff7ed !important;
+        border: 2px solid #fdba74 !important;
+        border-radius: 12px !important;
+        height: 56px !important;
+        font-size: 14px !important;
+        font-weight: 700 !important;
+        color: #c2410c !important;
+        box-shadow: 0 1px 4px rgba(234,88,12,0.10) !important;
+        transition: all 0.15s !important;
+    }
+    .stMarkdown:has(.action-btn-remove) + [data-testid="stButton"] > button:hover {
+        background: #ffedd5 !important;
+        border-color: #ea580c !important;
+        box-shadow: 0 3px 10px rgba(234,88,12,0.18) !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    act1, act2, act3, act4 = st.columns(4)
+
+    with act1:
+        st.markdown('<div class="action-btn-add"></div>', unsafe_allow_html=True)
+        if st.button("＋  Add New Student", use_container_width=True, key="show_add_btn"):
+            st.session_state.show_add_student = not st.session_state.get("show_add_student", False)
+            st.session_state.show_edit_selector = False
+            st.session_state.show_remove_selector = False
+            st.session_state.show_archive_selector = False
             st.rerun()
-    else:
+
+    with act2:
+        st.markdown('<div class="action-btn-edit"></div>', unsafe_allow_html=True)
+        if st.button("✏️  Edit Student", use_container_width=True, key="show_edit_selector_btn"):
+            st.session_state.show_edit_selector = not st.session_state.get("show_edit_selector", False)
+            st.session_state.show_add_student = False
+            st.session_state.show_remove_selector = False
+            st.session_state.show_archive_selector = False
+            st.rerun()
+
+    with act3:
+        st.markdown('<div class="action-btn-archive"></div>', unsafe_allow_html=True)
+        if st.button("🗄  Archive Student", use_container_width=True, key="show_archive_selector_btn"):
+            st.session_state.show_archive_selector = not st.session_state.get("show_archive_selector", False)
+            st.session_state.show_add_student = False
+            st.session_state.show_edit_selector = False
+            st.session_state.show_remove_selector = False
+            st.rerun()
+
+    with act4:
+        st.markdown('<div class="action-btn-remove"></div>', unsafe_allow_html=True)
+        if st.button("🗑  Remove Student", use_container_width=True, key="show_remove_selector_btn"):
+            st.session_state.show_remove_selector = not st.session_state.get("show_remove_selector", False)
+            st.session_state.show_add_student = False
+            st.session_state.show_edit_selector = False
+            st.session_state.show_archive_selector = False
+            st.rerun()
+
+    # ── Add new student panel ─────────────────────────────────────────────────
+    if st.session_state.get("show_add_student"):
         st.markdown(
-            '<div style="border:2px dashed #d1d5db;border-radius:16px;padding:20px 24px;">',
+            '<div style="background:#f0fdf4;border:2px solid #86efac;'
+            'border-radius:14px;padding:20px 22px;margin-top:14px;">',
             unsafe_allow_html=True
         )
-        c1, c2 = st.columns([5, 1])
+        st.markdown("**Add New Student**")
+        c1, c2, c3 = st.columns([5, 1, 1])
         with c1:
             new_name = st.text_input("Student name", placeholder="Full name",
                                      label_visibility="collapsed", key="new_student")
         with c2:
-            if st.button("Add", type="primary", use_container_width=True):
+            if st.button("Add", type="primary", use_container_width=True, key="add_stu_confirm"):
                 n = new_name.strip()
                 if n and n not in students:
                     students.append(n)
                     save_json(STUDENTS_FILE, students)
                     st.session_state.show_add_student = False
+                    st.session_state.selected_student = n
+                    st.session_state["show_settings"] = True
                     st.rerun()
                 elif n in students:
                     st.warning("Already exists.")
-        if st.button("Cancel", key="cancel_add", use_container_width=True):
-            st.session_state.show_add_student = False
-            st.rerun()
+        with c3:
+            if st.button("Cancel", use_container_width=True, key="cancel_add"):
+                st.session_state.show_add_student = False
+                st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Remove a student ──────────────────────────────────────────────────────
-    if students:
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        with st.expander("Remove a student"):
-            to_del = st.selectbox("Student", students, key="del_sel")
-            entry_count = len([e for e in load_json(DATA_FILE)
-                               if e.get("student_name") == to_del])
+    # ── Edit student panel ────────────────────────────────────────────────────
+    if st.session_state.get("show_edit_selector") and students:
+        profiles = load_profiles()
+        st.markdown(
+            '<div style="background:#eff6ff;border:2px solid #93c5fd;'
+            'border-radius:14px;padding:20px 22px;margin-top:14px;">',
+            unsafe_allow_html=True
+        )
+        st.markdown("**Edit Student Information**")
+        edit_target = st.selectbox("Select student to edit", students, key="edit_sel_target")
+        prof = profiles.get(edit_target, {})
 
-            if not st.session_state.get("confirm_del"):
-                st.markdown(
-                    '<div style="background:#fff7ed;border:1.5px solid #fed7aa;'
-                    'border-radius:10px;padding:14px 16px;margin:10px 0;">'
-                    '<div style="font-weight:700;color:#c2410c;font-size:13px;margin-bottom:4px;">'
-                    '⚠️ This action cannot be undone</div>'
-                    '<div style="font-size:13px;color:#7c2d12;">Removing <b>'
-                    + to_del + '</b> will permanently delete the student and all <b>'
-                    + str(entry_count) + ' ABC entr'
-                    + ('ies' if entry_count != 1 else 'y') + '</b>.</div>'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
-                if st.button("Delete student + all data", type="secondary"):
+        r1a, r1b = st.columns(2)
+        with r1a:
+            es_name = st.text_input("Full Name", value=edit_target, key="es_name")
+        with r1b:
+            es_dob = st.text_input("Date of Birth (MM/DD/YYYY)", value=prof.get("dob", ""),
+                                   key="es_dob", placeholder="MM/DD/YYYY")
+
+        r2a, r2b = st.columns(2)
+        with r2a:
+            grade_options = ["", "Pre-K", "Kindergarten", "1st", "2nd", "3rd",
+                             "4th", "5th", "6th", "7th", "8th", "9th", "10th",
+                             "11th", "12th", "Post-Secondary"]
+            cur_grade = prof.get("grade", "")
+            es_grade = st.selectbox("Grade", grade_options,
+                                    index=grade_options.index(cur_grade) if cur_grade in grade_options else 0,
+                                    key="es_grade")
+        with r2b:
+            gender_options = ["", "Male", "Female", "Non-binary", "Other", "Prefer not to say"]
+            cur_gender = prof.get("gender", "")
+            es_gender = st.selectbox("Gender", gender_options,
+                                     index=gender_options.index(cur_gender) if cur_gender in gender_options else 0,
+                                     key="es_gender")
+
+        r3a, r3b = st.columns(2)
+        with r3a:
+            disability_options = [
+                "", "Autism Spectrum Disorder", "Emotional Disturbance",
+                "Intellectual Disability", "Other Health Impairment",
+                "Specific Learning Disability", "Speech/Language Impairment",
+                "Traumatic Brain Injury", "Multiple Disabilities",
+                "Developmental Delay", "Other"
+            ]
+            cur_dis = prof.get("disability_category", "")
+            es_disability = st.selectbox("Disability Category (IDEA)", disability_options,
+                                         index=disability_options.index(cur_dis) if cur_dis in disability_options else 0,
+                                         key="es_disability")
+        with r3b:
+            es_eligibility = st.text_input("IEP / 504 Eligibility",
+                                           value=prof.get("eligibility", ""),
+                                           key="es_eligibility",
+                                           placeholder="e.g., IEP – Autism")
+
+        r4a, r4b = st.columns(2)
+        with r4a:
+            es_teacher = st.text_input("Primary Teacher", value=prof.get("teacher", ""), key="es_teacher")
+        with r4b:
+            es_case_mgr = st.text_input("Case Manager / BCBA", value=prof.get("case_manager", ""), key="es_case_mgr")
+
+        r5a, r5b = st.columns(2)
+        with r5a:
+            es_school = st.text_input("School District", value=prof.get("school", ""), key="es_school")
+        with r5b:
+            es_classroom = st.text_input("Classroom / Program", value=prof.get("classroom", ""), key="es_classroom")
+
+        es_notes = st.text_area("Background / Clinical Notes", value=prof.get("notes", ""),
+                                key="es_notes", height=80,
+                                placeholder="Relevant history, reinforcers, sensory needs, medical info, etc.")
+
+        sv1, sv2 = st.columns([1, 1])
+        with sv1:
+            if st.button("💾 Save Changes", type="primary", use_container_width=True, key="es_save"):
+                new_name_clean = es_name.strip()
+                all_stu = load_json(STUDENTS_FILE)
+                all_ent = load_json(DATA_FILE)
+                if not new_name_clean:
+                    st.warning("Name cannot be blank.")
+                elif new_name_clean != edit_target and new_name_clean in all_stu:
+                    st.warning(f"'{new_name_clean}' already exists.")
+                else:
+                    if new_name_clean != edit_target:
+                        all_stu = [new_name_clean if s == edit_target else s for s in all_stu]
+                        save_json(STUDENTS_FILE, all_stu)
+                        updated = [dict(e, student_name=new_name_clean)
+                                   if e.get("student_name") == edit_target else e for e in all_ent]
+                        save_json(DATA_FILE, updated)
+                        if edit_target in profiles:
+                            profiles[new_name_clean] = profiles.pop(edit_target)
+                    profiles[new_name_clean] = {
+                        "dob": es_dob.strip(), "grade": es_grade, "gender": es_gender,
+                        "disability_category": es_disability, "eligibility": es_eligibility.strip(),
+                        "teacher": es_teacher.strip(), "case_manager": es_case_mgr.strip(),
+                        "school": es_school.strip(), "classroom": es_classroom.strip(),
+                        "notes": es_notes.strip(),
+                    }
+                    save_profiles(profiles)
+                    audit_log("EDIT_STUDENT_INFO", f"Updated profile for '{new_name_clean}'"
+                              + (f" (renamed from '{edit_target}')" if new_name_clean != edit_target else ""))
+                    st.session_state.show_edit_selector = False
+                    st.rerun()
+        with sv2:
+            if st.button("Cancel", use_container_width=True, key="es_cancel"):
+                st.session_state.show_edit_selector = False
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Remove student panel ──────────────────────────────────────────────────
+    if st.session_state.get("show_remove_selector") and students:
+        st.markdown(
+            '<div style="background:#fff7ed;border:2px solid #fdba74;'
+            'border-radius:14px;padding:20px 22px;margin-top:14px;">',
+            unsafe_allow_html=True
+        )
+        st.markdown("**Remove a Student**")
+        to_del = st.selectbox("Select student to remove", students, key="del_sel")
+        entry_count = len([e for e in load_json(DATA_FILE) if e.get("student_name") == to_del])
+
+        st.markdown(
+            f'<div style="background:#fef2f2;border:1.5px solid #fca5a5;border-radius:10px;'
+            f'padding:12px 16px;margin:12px 0;font-size:13px;color:#7f1d1d;">'
+            f'⚠️ Removing <b>{to_del}</b> will permanently delete the student and all '
+            f'<b>{entry_count} ABC entr{"ies" if entry_count != 1 else "y"}</b>. '
+            f'This cannot be undone.</div>',
+            unsafe_allow_html=True
+        )
+        if not st.session_state.get("confirm_del"):
+            rd1, rd2 = st.columns([1, 1])
+            with rd1:
+                if st.button("Delete Student + All Data", type="secondary",
+                             use_container_width=True, key="del_stu_trigger"):
                     st.session_state.confirm_del = True
                     st.rerun()
-            else:
+            with rd2:
+                if st.button("Cancel", use_container_width=True, key="cancel_remove_panel"):
+                    st.session_state.show_remove_selector = False
+                    st.rerun()
+        else:
+            st.error(f"**Final confirmation:** permanently delete **{to_del}** and all {entry_count} entries?")
+            cf1, cf2 = st.columns(2)
+            with cf1:
+                if st.button("Yes, permanently delete", type="primary",
+                             use_container_width=True, key="del_stu_final"):
+                    students = [s for s in students if s != to_del]
+                    save_json(STUDENTS_FILE, students)
+                    entries = load_json(DATA_FILE)
+                    save_json(DATA_FILE,
+                              [e for e in entries if e.get("student_name") != to_del])
+                    st.session_state.confirm_del = False
+                    st.session_state.show_remove_selector = False
+                    st.rerun()
+            with cf2:
+                if st.button("Cancel", use_container_width=True, key="cancel_del"):
+                    st.session_state.confirm_del = False
+                    st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Archive student panel ─────────────────────────────────────────────────
+    if st.session_state.get("show_archive_selector") and students:
+        arc_target = st.selectbox("Select student to archive", students, key="arc_sel_target")
+        arc_entry_count = len([e for e in load_json(DATA_FILE) if e.get("student_name") == arc_target])
+        st.info(
+            f"📦 Archiving removes **{arc_target}** from the active list but preserves all "
+            f"{arc_entry_count} entr{'ies' if arc_entry_count != 1 else 'y'} and profile info. "
+            f"You can restore them at any time."
+        )
+        ar1, ar2 = st.columns(2)
+        with ar1:
+            if st.button("Archive Student", type="primary", use_container_width=True, key="arc_confirm"):
+                active = load_json(STUDENTS_FILE)
+                archive = load_archive()
+                active = [s for s in active if s != arc_target]
+                save_json(STUDENTS_FILE, active)
+                archive.append({
+                    "name": arc_target,
+                    "archived_date": datetime.now().strftime("%Y-%m-%d"),
+                    "entry_count": arc_entry_count,
+                })
+                save_archive(archive)
+                audit_log("ARCHIVE_STUDENT", f"Archived student '{arc_target}' ({arc_entry_count} entries preserved)")
+                st.session_state.show_archive_selector = False
+                st.rerun()
+        with ar2:
+            if st.button("Cancel", use_container_width=True, key="arc_cancel"):
+                st.session_state.show_archive_selector = False
+                st.rerun()
+
+    # ── Archived students section ─────────────────────────────────────────────
+    archive = load_archive()
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:13px;font-weight:700;color:#6d28d9;'
+        'letter-spacing:0.05em;text-transform:uppercase;margin-bottom:8px;">'
+        '🗄 Archived Students</div>',
+        unsafe_allow_html=True
+    )
+    if not archive:
+        st.markdown(
+            '<div style="background:#faf5ff;border:1.5px solid #e9d5ff;border-radius:12px;'
+            'padding:16px 20px;text-align:center;color:#7c3aed;font-size:13px;">'
+            'No archived students. Use <b>🗄 Archive Student</b> above to move a student here '
+            'while preserving all their data.</div>',
+            unsafe_allow_html=True
+        )
+    if archive:
+        for idx, rec in enumerate(archive):
+            arc_name = rec.get("name", "Unknown")
+            arc_date = rec.get("archived_date", "")
+            arc_count = rec.get("entry_count", 0)
+            # Current actual entry count (data still in file)
+            current_count = len([e for e in load_json(DATA_FILE) if e.get("student_name") == arc_name])
+            col_info, col_restore, col_delete = st.columns([5, 1.4, 1.4])
+            with col_info:
                 st.markdown(
-                    '<div style="background:#fef2f2;border:2px solid #fca5a5;'
-                    'border-radius:10px;padding:16px;margin:10px 0;">'
-                    '<div style="font-weight:700;color:#dc2626;font-size:14px;margin-bottom:6px;">'
-                    '🚨 Final confirmation</div>'
-                    '<div style="font-size:13px;color:#7f1d1d;">Permanently delete <b>'
-                    + to_del + '</b> and all <b>' + str(entry_count) + ' entr'
-                    + ('ies' if entry_count != 1 else 'y') + '</b>? This cannot be recovered.</div>'
-                    '</div>',
+                    f'<div style="background:#faf5ff;border:1.5px solid #ddd6fe;border-radius:10px;'
+                    f'padding:10px 14px;display:flex;align-items:center;gap:10px;">'
+                    f'<div style="width:36px;height:36px;background:#ede9fe;border-radius:50%;'
+                    f'display:flex;align-items:center;justify-content:center;'
+                    f'color:#7c3aed;font-weight:700;font-size:14px;">{arc_name[0].upper()}</div>'
+                    f'<div><div style="font-weight:700;color:#4c1d95;font-size:14px;">{arc_name}</div>'
+                    f'<div style="font-size:12px;color:#7c3aed;">Archived {arc_date} &nbsp;·&nbsp; {current_count} entries</div>'
+                    f'</div></div>',
                     unsafe_allow_html=True
                 )
-                c1, c2 = st.columns(2)
-                with c1:
+            with col_restore:
+                if st.button("↩ Restore", use_container_width=True, key=f"restore_{idx}"):
+                    active = load_json(STUDENTS_FILE)
+                    if arc_name not in active:
+                        active.append(arc_name)
+                        save_json(STUDENTS_FILE, active)
+                    updated_archive = [r for r in archive if r.get("name") != arc_name]
+                    save_archive(updated_archive)
+                    audit_log("RESTORE_STUDENT", f"Restored archived student '{arc_name}'")
+                    st.rerun()
+            with col_delete:
+                if st.button("🗑 Delete", use_container_width=True, key=f"arc_del_{idx}"):
+                    st.session_state[f"confirm_arc_del_{idx}"] = True
+                    st.rerun()
+            if st.session_state.get(f"confirm_arc_del_{idx}"):
+                st.error(
+                    f"Permanently delete **{arc_name}** and all {current_count} entries? "
+                    f"This cannot be undone."
+                )
+                fd1, fd2 = st.columns(2)
+                with fd1:
                     if st.button("Yes, permanently delete", type="primary",
-                                 use_container_width=True):
-                        students = [s for s in students if s != to_del]
-                        save_json(STUDENTS_FILE, students)
-                        entries = load_json(DATA_FILE)
-                        save_json(DATA_FILE,
-                                  [e for e in entries if e.get("student_name") != to_del])
-                        st.session_state.confirm_del = False
+                                 use_container_width=True, key=f"arc_del_confirm_{idx}"):
+                        updated_archive = [r for r in archive if r.get("name") != arc_name]
+                        save_archive(updated_archive)
+                        all_entries = load_json(DATA_FILE)
+                        save_json(DATA_FILE, [e for e in all_entries if e.get("student_name") != arc_name])
+                        profiles = load_profiles()
+                        if arc_name in profiles:
+                            del profiles[arc_name]
+                            save_profiles(profiles)
+                        audit_log("DELETE_ARCHIVED_STUDENT", f"Permanently deleted archived student '{arc_name}'")
+                        st.session_state.pop(f"confirm_arc_del_{idx}", None)
                         st.rerun()
-                with c2:
-                    if st.button("Cancel", use_container_width=True, key="cancel_del"):
-                        st.session_state.confirm_del = False
+                with fd2:
+                    if st.button("Cancel", use_container_width=True, key=f"arc_del_cancel_{idx}"):
+                        st.session_state.pop(f"confirm_arc_del_{idx}", None)
                         st.rerun()
 
 # ── Tab: New Entry ────────────────────────────────────────────────────────────
@@ -777,6 +1473,99 @@ def tab_new_entry(all_entries, student_name, observer_name):
     interval_type = None
     interval_length = None
     interval_number = None
+
+    # ── Session-Level MO Checklist (outside form — persists across entries) ───
+    with st.expander("⚡ Motivating Operations — Conditions Present Today", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Note any conditions present <b>before or during this session</b>. '
+            'Check all that apply. These are saved with every entry recorded today '
+            'and used to identify which conditions predict higher behavior rates.</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── Tier 1 auto-detect from prior entries this session ────────────────
+        session_date_str = str(date.today())
+        prior_today = [e for e in all_entries
+                       if e.get("student_name") == student_name
+                       and str(e.get("date", ""))[:10] == session_date_str]
+        auto_flags = set()
+        if prior_today:
+            last_ant  = (prior_today[-1].get("antecedent") or "").lower()
+            last_act  = (prior_today[-1].get("activity")  or "").lower()
+            last_inst = (prior_today[-1].get("instructional_format") or "").lower()
+            if any(w in last_ant for w in ["instruction", "direction", "request", "task", "demand"]):
+                auto_flags.add("high_demand")
+            if any(w in last_ant for w in ["transition", "activity"]):
+                auto_flags.add("transition")
+            if any(w in last_act for w in ["free", "unstructured", "leisure", "alone"]):
+                auto_flags.add("sensory_under")
+            if any(w in last_inst for w in ["independent", "seat work"]):
+                auto_flags.add("independent_work")
+
+        if auto_flags:
+            auto_labels = []
+            for domain, items in MO_DEFAULTS.items():
+                for mo in items:
+                    if mo["key"] in auto_flags:
+                        auto_labels.append(mo["label"][:60] + "…")
+            st.markdown(
+                '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;'
+                'padding:8px 12px;margin-bottom:10px;font-size:12px;color:#15803d;">'
+                '<b>Auto-detected from today\'s entries:</b> ' + " · ".join(auto_labels) + '</div>',
+                unsafe_allow_html=True
+            )
+
+        # ── Checkboxes by domain ──────────────────────────────────────────────
+        if "mo_session_state" not in st.session_state:
+            st.session_state.mo_session_state = {}
+
+        for domain, items in MO_DEFAULTS.items():
+            st.markdown(
+                f'<div style="font-size:12px;font-weight:700;color:#374151;'
+                f'margin:10px 0 4px 0;">{domain}</div>',
+                unsafe_allow_html=True
+            )
+            for mo in items:
+                is_auto = mo["key"] in auto_flags
+                default_val = st.session_state.mo_session_state.get(mo["key"], is_auto)
+                label = mo["label"]
+                if is_auto:
+                    label = "🔍 " + label + " (auto-detected)"
+                checked = st.checkbox(label, value=default_val, key=f"mo_{mo['key']}")
+                st.session_state.mo_session_state[mo["key"]] = checked
+
+        # ── Custom MOs ────────────────────────────────────────────────────────
+        custom_mos = cats.get("custom_mos", [])
+        if custom_mos:
+            st.markdown(
+                '<div style="font-size:12px;font-weight:700;color:#374151;'
+                'margin:10px 0 4px 0;">Custom</div>',
+                unsafe_allow_html=True
+            )
+            for cmo in custom_mos:
+                safe_key = "mo_custom_" + cmo[:30].replace(" ", "_")
+                default_val = st.session_state.mo_session_state.get(safe_key, False)
+                checked = st.checkbox(cmo, value=default_val, key=safe_key)
+                st.session_state.mo_session_state[safe_key] = checked
+
+        # ── Free text for Tier 3 / idiosyncratic conditions ───────────────────
+        st.markdown(
+            '<div style="font-size:12px;font-weight:700;color:#374151;margin:10px 0 4px 0;">'
+            'Other conditions not listed above</div>',
+            unsafe_allow_html=True
+        )
+        mo_notes = st.text_input(
+            "Other MO notes",
+            value=st.session_state.get("mo_notes_today", ""),
+            placeholder="e.g. 'wore new shoes', 'substitute teacher', 'parent visit day'",
+            label_visibility="collapsed",
+            key="mo_notes_input"
+        )
+        st.session_state["mo_notes_today"] = mo_notes
+
+        if st.button("✓ Save MO Conditions for This Session", key="save_mo_btn", type="primary"):
+            st.success("MO conditions saved — they will be attached to all entries recorded today.")
 
     with st.form("abc_form", clear_on_submit=True):
         # Date / Time / Duration
@@ -831,22 +1620,39 @@ def tab_new_entry(all_entries, student_name, observer_name):
                                   format_func=lambda x: "Select antecedent" if x == "" else x)
         behavior = st.selectbox("Behavior (B) *", [""] + cats["behaviors"],
                                 format_func=lambda x: "Select behavior" if x == "" else x)
+        # Show operational definition if one exists for the selected behavior
+        if behavior:
+            _beh_def = cats.get("behavior_definitions", {}).get(behavior, "").strip()
+            if _beh_def:
+                st.markdown(
+                    f'<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;'
+                    f'padding:10px 14px;margin:4px 0 8px 0;font-size:0.88rem;color:#1e40af;">'
+                    f'<span style="font-weight:600;">📋 Operational Definition:</span> {_beh_def}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
         consequence = st.selectbox("Consequence (C) *", [""] + cats["consequences"],
                                    format_func=lambda x: "Select consequence" if x == "" else x)
 
-        # ABC Chain linking
+        # ── Episode & Severity ────────────────────────────────────────────────
         st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
-        chain_col1, chain_col2 = st.columns([1, 3])
-        with chain_col1:
-            is_chain = st.checkbox("Part of behavior chain", key="chain_cb")
-        with chain_col2:
-            chain_label = st.text_input(
-                "Chain label (e.g. 'Morning transition')",
-                placeholder="Label to link related entries",
-                label_visibility="collapsed",
-                key="chain_label_inp",
-                disabled=not is_chain
-            ) if is_chain else ""
+        ep_col, sev_col = st.columns(2)
+        with ep_col:
+            episode_id = st.text_input(
+                "Episode ID",
+                placeholder="e.g. 'AM-episode-3' — links entries in same event",
+                help="Tag entries that belong to the same behavioral episode or escalation chain.",
+                key="episode_id_inp",
+            )
+        with sev_col:
+            severity_tier = st.radio(
+                "Severity Tier",
+                options=["—", "Tier 1 — Mild", "Tier 2 — Moderate", "Tier 3 — Severe"],
+                index=0,
+                horizontal=True,
+                key="severity_tier_inp",
+                help="Tier 1 = low intensity / early escalation. Tier 3 = highest intensity / most dangerous.",
+            )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -885,8 +1691,18 @@ def tab_new_entry(all_entries, student_name, observer_name):
                                           use_container_width=True)
 
     if submitted:
+        errors = []
+        if not antecedent:
+            errors.append("Antecedent (A) is required.")
         if not behavior:
-            st.error("Behavior is required.")
+            errors.append("Behavior (B) is required.")
+        if not consequence:
+            errors.append("Consequence (C) is required.")
+        if entry_date > date.today():
+            errors.append("Date cannot be in the future.")
+        if errors:
+            for err in errors:
+                st.error(err)
             return
         # Encode image to base64 if provided
         image_b64 = None
@@ -899,6 +1715,7 @@ def tab_new_entry(all_entries, student_name, observer_name):
             "date": str(entry_date),
             "time": str(entry_time),
             "student_name": student_name,
+            "student_id": roster_id_for_name(student_name),
             "observer_name": observer_name,
             "observation_duration_minutes": obs_minutes or None,
             "location": location or None,
@@ -912,7 +1729,12 @@ def tab_new_entry(all_entries, student_name, observer_name):
             "antecedent": antecedent or None,
             "behavior": behavior,
             "consequence": consequence or None,
-            "chain_label": chain_label.strip() if is_chain and chain_label else None,
+            "episode_id": episode_id.strip() or None,
+            "severity_tier": severity_tier if severity_tier != "—" else None,
+            "motivating_operations": {
+                k: v for k, v in st.session_state.get("mo_session_state", {}).items() if v
+            } or None,
+            "mo_notes": st.session_state.get("mo_notes_today", "").strip() or None,
             "actual_duration_seconds": (dur_amount * 60 if dur_unit == "Minutes" else dur_amount) or None,
             "duration": duration_from_seconds(dur_amount * 60 if dur_unit == "Minutes" else dur_amount),
             "intensity": intensity,
@@ -1034,11 +1856,27 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
     </div>""", unsafe_allow_html=True)
 
     if not filtered_entries:
-        st.markdown("""
-        <div style="text-align:center;padding:48px;color:#9ca3af;font-size:14px;">
-            No entries yet.
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            '<div style="text-align:center;padding:48px 20px;">'
+            '<div style="font-size:40px;margin-bottom:12px;">📋</div>'
+            '<div style="font-size:16px;font-weight:600;color:#374151;margin-bottom:6px;">No entries yet</div>'
+            '<div style="font-size:13px;color:#9ca3af;">Go to the <b>📋 New ABC Entry</b> tab to record your first observation.</div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
         return
+
+    # Free-text search
+    search_q = st.text_input("🔍 Search entries", placeholder="Search notes, antecedents, consequences…",
+                              key="log_search", label_visibility="collapsed")
+    if search_q:
+        q = search_q.lower()
+        filtered_entries = [
+            e for e in filtered_entries
+            if any(q in str(e.get(f, "") or "").lower()
+                   for f in ["antecedent", "behavior", "consequence", "notes",
+                              "observer_name", "location", "activity"])
+        ]
 
     filtered_entries = _apply_filters(filtered_entries,
                                       "log_beh_f", "log_obs_f",
@@ -1047,8 +1885,21 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
     df = pd.DataFrame(filtered_entries).sort_values("number", ascending=False)
     csv = df.to_csv(index=False).encode()
 
+    def _to_xlsx(dataframe):
+        import io
+        try:
+            import openpyxl  # noqa: F401
+        except ImportError:
+            return None
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            dataframe.to_excel(writer, index=False, sheet_name="ABC Data")
+        return buf.getvalue()
+
+    xlsx_bytes = _to_xlsx(df)
+
     entry_label = "entry" if len(filtered_entries) == 1 else "entries"
-    ec1, ec2 = st.columns([8, 2])
+    ec1, ec2, ec3 = st.columns([7, 2, 2])
     with ec1:
         st.markdown(
             f'<div style="background:#dcfce7;color:#16a34a;font-weight:600;font-size:13px;'
@@ -1059,15 +1910,37 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
     with ec2:
         st.download_button("Export CSV", csv, "abc_data.csv", "text/csv",
                            key="dl_log", use_container_width=True)
+    with ec3:
+        if xlsx_bytes:
+            st.download_button("Export XLSX", xlsx_bytes, "abc_data.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_log_xlsx", use_container_width=True)
+        else:
+            st.caption("openpyxl not installed")
 
     # Build HTML table
     rows_html = ""
     for _, row in df.iterrows():
-        chain = row.get("chain_label") or ""
-        chain_cell = (
+        episode = str(row.get("episode_id") or "").strip()
+        episode = "" if episode.lower() in ("none", "nan") else episode
+        episode_cell = (
             f'<span style="background:#ede9fe;color:#6d28d9;font-size:11px;'
-            f'font-weight:600;padding:2px 7px;border-radius:10px;">{chain}</span>'
-            if chain else "—"
+            f'font-weight:600;padding:2px 7px;border-radius:10px;">{episode}</span>'
+            if episode else "—"
+        )
+        _sev_raw = str(row.get("severity_tier") or "").strip()
+        _sev_raw = "" if _sev_raw.lower() in ("none", "nan") else _sev_raw
+        _sev_colors = {
+            "Tier 1": ("#fef9c3", "#854d0e"),
+            "Tier 2": ("#ffedd5", "#c2410c"),
+            "Tier 3": ("#fee2e2", "#991b1b"),
+        }
+        _sev_key = _sev_raw[:6] if _sev_raw else ""
+        _sev_bg, _sev_fg = _sev_colors.get(_sev_key, ("#f3f4f6", "#6b7280"))
+        severity_cell = (
+            f'<span style="background:{_sev_bg};color:{_sev_fg};font-size:11px;'
+            f'font-weight:600;padding:2px 7px;border-radius:10px;">{_sev_raw}</span>'
+            if _sev_raw else "—"
         )
         interval = row.get("interval_type") or ""
         interval_num = row.get("interval_number")
@@ -1100,7 +1973,8 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
             f'<td style="font-weight:600;">{fmt_duration(row)}</td>'
             f'<td>{intensity_badge(row.get("intensity"))}</td>'
             f'<td>{interval_cell}</td>'
-            f'<td>{chain_cell}</td>'
+            f'<td>{episode_cell}</td>'
+            f'<td>{severity_cell}</td>'
             f'<td style="text-align:center;">{photo_cell}</td>'
             '</tr>'
         )
@@ -1110,7 +1984,7 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
         f'font-weight:700;letter-spacing:.06em;color:#6b7280;">{h}</th>'
         for h in ["#", "DATE", "TIME", "STUDENT", "OBSERVER", "LOCATION",
                   "ANTECEDENT", "BEHAVIOR", "CONSEQUENCE", "DURATION", "INT",
-                  "INTERVAL", "CHAIN", "📷"]
+                  "INTERVAL", "EPISODE", "SEVERITY", "📷"]
     )
     table_html = (
         '<div style="background:white;border:1.5px solid #e5e7eb;border-radius:12px;'
@@ -1139,20 +2013,95 @@ def tab_log(filtered_entries, all_entries, student_name="", abbrevs=None):
                         st.caption(e["notes"])
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("**Delete an entry**")
-    nums = sorted([e.get("number") for e in filtered_entries if e.get("number")],
-                  reverse=True)
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        del_num = st.selectbox("Entry #", nums, key="del_num",
-                               label_visibility="collapsed")
-    with c2:
-        if st.button("Delete", type="secondary", use_container_width=True):
-            save_json(DATA_FILE,
-                      [e for e in all_entries if e.get("number") != del_num])
-            audit_log("DELETE_ENTRY", f"Entry #{del_num} deleted")
-            st.success(f"Entry #{del_num} deleted.")
-            st.rerun()
+    nums = sorted([e.get("number") for e in filtered_entries if e.get("number")], reverse=True)
+
+    # ── Edit an entry ─────────────────────────────────────────────────────────
+    with st.expander("✏️ Edit an entry"):
+        cats = load_categories()
+        edit_num = st.selectbox("Select entry to edit", nums, key="edit_entry_num",
+                                format_func=lambda n: f"Entry #{n}")
+        edit_entry = next((e for e in filtered_entries if e.get("number") == edit_num), None)
+        if edit_entry:
+            with st.form("edit_entry_form"):
+                ee1, ee2 = st.columns(2)
+                with ee1:
+                    e_date = st.date_input("Date", value=pd.to_datetime(edit_entry.get("date", date.today())).date())
+                with ee2:
+                    try:
+                        t_val = datetime.strptime(str(edit_entry.get("time","00:00"))[:5], "%H:%M").time()
+                    except Exception:
+                        t_val = datetime.now().time()
+                    e_time = st.time_input("Time", value=t_val)
+
+                e_ant = st.selectbox("Antecedent (A) *", [""] + cats["antecedents"],
+                                     index=([""] + cats["antecedents"]).index(edit_entry.get("antecedent",""))
+                                     if edit_entry.get("antecedent","") in cats["antecedents"] else 0)
+                e_beh = st.selectbox("Behavior (B) *", [""] + cats["behaviors"],
+                                     index=([""] + cats["behaviors"]).index(edit_entry.get("behavior",""))
+                                     if edit_entry.get("behavior","") in cats["behaviors"] else 0)
+                e_con = st.selectbox("Consequence (C) *", [""] + cats["consequences"],
+                                     index=([""] + cats["consequences"]).index(edit_entry.get("consequence",""))
+                                     if edit_entry.get("consequence","") in cats["consequences"] else 0)
+
+                ee3, ee4 = st.columns(2)
+                with ee3:
+                    loc_opts = [""] + LOCATIONS
+                    e_loc = st.selectbox("Location", loc_opts,
+                                         index=loc_opts.index(edit_entry.get("location",""))
+                                         if edit_entry.get("location","") in loc_opts else 0)
+                with ee4:
+                    e_intensity = st.radio("Intensity (1–10)", options=list(range(1,11)),
+                                           index=int(edit_entry.get("intensity", 5)) - 1,
+                                           horizontal=True)
+                e_notes = st.text_area("Notes", value=edit_entry.get("notes","") or "")
+                save_edit = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+
+            if save_edit:
+                edit_errors = []
+                if not e_ant:
+                    edit_errors.append("Antecedent is required.")
+                if not e_beh:
+                    edit_errors.append("Behavior is required.")
+                if not e_con:
+                    edit_errors.append("Consequence is required.")
+                if e_date > date.today():
+                    edit_errors.append("Date cannot be in the future.")
+                if edit_errors:
+                    for err in edit_errors:
+                        st.error(err)
+                else:
+                    updated = []
+                    for e in all_entries:
+                        if e.get("number") == edit_num and e.get("student_name") == student_name:
+                            e = dict(e)
+                            e["date"] = str(e_date)
+                            e["time"] = str(e_time)
+                            e["antecedent"] = e_ant or None
+                            e["behavior"] = e_beh
+                            e["consequence"] = e_con or None
+                            e["location"] = e_loc or None
+                            e["intensity"] = e_intensity
+                            e["notes"] = e_notes.strip() or None
+                        updated.append(e)
+                    save_json(DATA_FILE, updated)
+                    audit_log("EDIT_ENTRY", f"Entry #{edit_num} edited for student [{student_name}]")
+                    st.success(f"Entry #{edit_num} updated.")
+                    st.rerun()
+
+    # ── Delete an entry ───────────────────────────────────────────────────────
+    with st.expander("🗑 Delete an entry"):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            del_num = st.selectbox("Entry #", nums, key="del_num",
+                                   label_visibility="collapsed",
+                                   format_func=lambda n: f"Entry #{n}")
+        with c2:
+            if st.button("Delete", type="secondary", use_container_width=True):
+                save_json(DATA_FILE,
+                          [e for e in all_entries if e.get("number") != del_num])
+                audit_log("DELETE_ENTRY", f"Entry #{del_num} deleted")
+                st.success(f"Entry #{del_num} deleted.")
+                st.rerun()
 
 # ── PDF Report helpers ────────────────────────────────────────────────────────
 def _fig_to_svg(fig, width=680, height=300):
@@ -1619,7 +2568,7 @@ def tab_summary(filtered_entries):
                             font_family="system-ui",
                             height=max(200, len(counts) * 44 + 80),
                             margin=dict(l=0, r=50, t=10, b=50),
-                            xaxis=dict(gridcolor="#e5e7eb", automargin=True),
+                            xaxis=dict(gridcolor="#e5e7eb", automargin=True, tickformat="d"),
                             yaxis=dict(autorange="reversed", automargin=True),
                         )
                         field_subtitles = {
@@ -1658,7 +2607,8 @@ def tab_summary(filtered_entries):
                          color_discrete_sequence=[BLUE])
             fig.update_layout(plot_bgcolor="white", paper_bgcolor="white",
                               font_family="system-ui", margin=dict(l=0,r=50,t=10,b=50),
-                              height=300, yaxis=dict(autorange="reversed", automargin=True))
+                              height=300, xaxis=dict(tickformat="d"),
+                              yaxis=dict(autorange="reversed", automargin=True))
             fig.update_traces(text=beh_counts["count"], textposition="inside",
                               texttemplate="%{text:.0f}",
                               insidetextfont=dict(color="white", size=13))
@@ -1679,7 +2629,8 @@ def tab_summary(filtered_entries):
                          color_discrete_sequence=["#818cf8"])
             fig.update_layout(plot_bgcolor="white", paper_bgcolor="white",
                               font_family="system-ui", margin=dict(l=0,r=50,t=10,b=50),
-                              height=300, yaxis=dict(autorange="reversed", automargin=True))
+                              height=300, xaxis=dict(tickformat="d"),
+                              yaxis=dict(autorange="reversed", automargin=True))
             fig.update_traces(text=ant_counts["count"], textposition="inside",
                               texttemplate="%{text:.0f}",
                               insidetextfont=dict(color="white", size=13))
@@ -1704,7 +2655,8 @@ def tab_summary(filtered_entries):
                          color_discrete_sequence=["#60a5fa"])
             fig.update_layout(plot_bgcolor="white", paper_bgcolor="white",
                               font_family="system-ui", margin=dict(l=0,r=50,t=10,b=50),
-                              height=260, yaxis=dict(autorange="reversed", automargin=True))
+                              height=260, xaxis=dict(tickformat="d"),
+                              yaxis=dict(autorange="reversed", automargin=True))
             fig.update_traces(text=con_counts["count"], textposition="inside",
                               texttemplate="%{text:.0f}",
                               insidetextfont=dict(color="white", size=13))
@@ -1955,6 +2907,55 @@ def tab_summary(filtered_entries):
         fig = px.line(time_df, x="date_only", y="count", color="behavior",
                       labels={"date_only": "Date", "count": "Count"},
                       markers=True)
+
+        # ── Trend / Celeration overlay ────────────────────────────────────────
+        trend_rows = []
+        _color_map = {tr.name: tr.line.color for tr in fig.data}
+        for beh in time_df["behavior"].unique():
+            sub = time_df[time_df["behavior"] == beh].sort_values("date_only")
+            if len(sub) < 2:
+                continue
+            days = (sub["date_only"] - sub["date_only"].min()).dt.days.to_numpy(dtype=float)
+            counts = sub["count"].to_numpy(dtype=float)
+            span = days.max() - days.min()
+            if span <= 0:
+                continue
+            # Linear slope (counts/day → counts/week)
+            slope_day, intercept = np.polyfit(days, counts, 1)
+            slope_week = slope_day * 7
+            # Log-linear celeration (× per week)
+            log_counts = np.log(counts + 1.0)
+            log_slope, _ = np.polyfit(days, log_counts, 1)
+            celeration = float(np.exp(log_slope * 7))
+            if celeration >= 1.10:
+                direction, dcolor = "Accelerating ↗", "#dc2626"
+            elif celeration <= 0.90:
+                direction, dcolor = "Decelerating ↘", "#15803d"
+            else:
+                direction, dcolor = "Stable →", "#6b7280"
+
+            # Add trend line to chart
+            x_fit = [sub["date_only"].min(), sub["date_only"].max()]
+            y_fit = [max(0.0, intercept),
+                     max(0.0, intercept + slope_day * span)]
+            fig.add_trace(_go.Scatter(
+                x=x_fit, y=y_fit, mode="lines",
+                name=f"{beh} trend",
+                line=dict(color=_color_map.get(beh, "#6b7280"),
+                           dash="dash", width=1.5),
+                hovertemplate=(f"<b>{beh} trend</b><br>"
+                                f"Slope: {slope_week:+.2f} /wk<br>"
+                                f"Celeration: ×{celeration:.2f} /wk<extra></extra>"),
+                showlegend=False,
+            ))
+            trend_rows.append({
+                "Behavior": beh,
+                "Slope (counts/wk)": round(slope_week, 2),
+                "Celeration (×/wk)": round(celeration, 2),
+                "Direction": direction,
+                "_color": dcolor,
+            })
+
         fig.update_layout(
             plot_bgcolor="white", paper_bgcolor="white",
             font_family="system-ui",
@@ -1972,6 +2973,39 @@ def tab_summary(filtered_entries):
             <div style="font-weight:600;font-size:15px;color:#111;margin-bottom:8px;">
             Behaviors Over Time</div>""", unsafe_allow_html=True)
         st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CONFIG)
+
+        # Trend metrics cards
+        if trend_rows:
+            st.markdown(
+                '<div style="font-size:11px;font-weight:700;color:#6b7280;'
+                'text-transform:uppercase;letter-spacing:.05em;margin:12px 0 8px 0;">'
+                'Trend Analysis — Linear Slope &amp; Celeration (×/week)</div>',
+                unsafe_allow_html=True
+            )
+            st.caption(
+                "Celeration = multiplicative rate of change per week "
+                "(×1.0 = stable, ×2.0 = doubling, ÷2.0 = halving). "
+                "Threshold: ≥×1.10 accelerating, ≤×0.90 decelerating."
+            )
+            t_cols = st.columns(min(4, len(trend_rows)))
+            for i, row in enumerate(trend_rows):
+                with t_cols[i % len(t_cols)]:
+                    st.markdown(
+                        f'<div style="background:white;border:1.5px solid {row["_color"]};'
+                        f'border-radius:10px;padding:12px;margin-bottom:8px;">'
+                        f'<div style="font-size:11px;font-weight:700;color:#111;'
+                        f'margin-bottom:6px;">{row["Behavior"]}</div>'
+                        f'<div style="font-size:11px;color:#6b7280;">Slope</div>'
+                        f'<div style="font-size:16px;font-weight:700;color:#111;'
+                        f'margin-bottom:4px;">{row["Slope (counts/wk)"]:+.2f} /wk</div>'
+                        f'<div style="font-size:11px;color:#6b7280;">Celeration</div>'
+                        f'<div style="font-size:16px;font-weight:700;color:#111;'
+                        f'margin-bottom:4px;">×{row["Celeration (×/wk)"]:.2f} /wk</div>'
+                        f'<div style="font-size:11px;font-weight:700;color:{row["_color"]};'
+                        f'margin-top:6px;">{row["Direction"]}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Occurrence Over Time ──────────────────────────────────────────────────
@@ -2394,6 +3428,464 @@ def tab_summary(filtered_entries):
             st.plotly_chart(fig_trend, use_container_width=True, config=_PLOTLY_CONFIG)
             st.markdown("</div>", unsafe_allow_html=True)
 
+
+
+    # ── AI Pattern Analysis ───────────────────────────────────────────────────
+    st.markdown(
+        '<div style="background:white;border:1.5px solid #e5e7eb;border-radius:12px;'
+        'padding:20px;margin-top:16px;">'
+        '<div style="font-weight:700;font-size:15px;color:#111;margin-bottom:4px;">AI Pattern Analysis</div>'
+        '<div style="font-size:12px;color:#6b7280;margin-bottom:14px;">'
+        'Analyzes all data above — setting fields, ABC fields, behavior dimensions, trends, and function.</div>',
+        unsafe_allow_html=True
+    )
+
+    if not _ANTHROPIC_AVAILABLE:
+        st.warning("Install the `anthropic` package to enable AI analysis: `pip install anthropic`")
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            api_key = st.text_input(
+                "Anthropic API Key", type="password",
+                placeholder="sk-ant-...",
+                help="Enter your Anthropic API key. It is not stored.",
+                key="ai_api_key_input"
+            )
+
+        if st.button("Run AI Analysis", type="primary", key="ai_analyze_btn"):
+            if not api_key:
+                st.warning("An API key is required to run analysis.")
+            else:
+                # Build a structured data summary to send to the model
+                summary_parts = []
+
+                summary_parts.append(f"Student data summary ({len(df)} entries):")
+                summary_parts.append(f"- Date range: {df['date'].min()} to {df['date'].max()}" if "date" in df.columns else "")
+
+                if "behavior" in df.columns:
+                    beh_counts = df["behavior"].value_counts()
+                    summary_parts.append("Behavior frequencies: " + ", ".join(f"{b} ({n})" for b, n in beh_counts.items()))
+
+                if "antecedent" in df.columns:
+                    ant_counts = df["antecedent"].value_counts()
+                    summary_parts.append("Antecedent frequencies: " + ", ".join(f"{a} ({n})" for a, n in ant_counts.items()))
+
+                if "consequence" in df.columns:
+                    con_counts = df["consequence"].value_counts()
+                    summary_parts.append("Consequence frequencies: " + ", ".join(f"{c} ({n})" for c, n in con_counts.items()))
+
+                for field, label in [("location","Location"),("people_intervening","People Intervening"),
+                                     ("subject","Subject"),("activity","Activity"),
+                                     ("instructional_format","Instructional Format")]:
+                    if field in df.columns and df[field].notna().any():
+                        counts = df[field].value_counts()
+                        summary_parts.append(f"{label}: " + ", ".join(f"{v} ({n})" for v, n in counts.items()))
+
+                if "intensity" in df.columns and df["intensity"].notna().any():
+                    summary_parts.append(f"Average intensity: {df['intensity'].mean():.1f}/10")
+
+                if "date" in df.columns:
+                    df["_dow"] = pd.to_datetime(df["date"]).dt.day_name()
+                    dow = df["_dow"].value_counts()
+                    summary_parts.append("Behavior by day of week: " + ", ".join(f"{d} ({n})" for d, n in dow.items()))
+
+                if "time" in df.columns and df["time"].notna().any():
+                    try:
+                        df["_hour"] = pd.to_datetime(df["time"], format="%H:%M:%S", errors="coerce").dt.hour
+                        hour_counts = df["_hour"].dropna().value_counts().sort_index()
+                        if len(hour_counts):
+                            summary_parts.append("Behavior by hour: " + ", ".join(f"{int(h):02d}:00 ({n})" for h, n in hour_counts.items()))
+                    except Exception:
+                        pass
+
+                data_text = "\n".join(p for p in summary_parts if p)
+
+                prompt = (
+                    "You are a Board Certified Behavior Analyst (BCBA) reviewing ABC (Antecedent-Behavior-Consequence) "
+                    "data collected on a student. Analyze the following data and identify meaningful patterns, "
+                    "hypotheses about behavior function, notable antecedent-behavior-consequence chains, "
+                    "time/setting patterns, and any clinical observations that would be useful for an FBA report. "
+                    "Be specific and reference the actual data values. Organize your response with clear headings.\n\n"
+                    + data_text
+                )
+
+                with st.spinner("Analyzing data…"):
+                    try:
+                        client = _anthropic.Anthropic(api_key=api_key)
+                        message = client.messages.create(
+                            model="claude-opus-4-6",
+                            max_tokens=1024,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+                        result = message.content[0].text
+                        st.session_state["ai_analysis_result"] = result
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
+
+        if st.session_state.get("ai_analysis_result"):
+            st.markdown(
+                '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;'
+                'padding:16px;margin-top:12px;font-size:14px;line-height:1.7;color:#111;">'
+                + st.session_state["ai_analysis_result"].replace("\n", "<br>") + '</div>',
+                unsafe_allow_html=True
+            )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Standard Celeration Chart ─────────────────────────────────────────────
+    if ("date" in df.columns and "behavior" in df.columns
+            and "observation_duration_minutes" in df.columns
+            and df["observation_duration_minutes"].notna().any()):
+
+        scc_df = df.dropna(subset=["observation_duration_minutes"]).copy()
+        scc_df["date_only"] = pd.to_datetime(scc_df["date"]).dt.normalize()
+        scc_df["observation_duration_minutes"] = \
+            pd.to_numeric(scc_df["observation_duration_minutes"], errors="coerce")
+        scc_df = scc_df[scc_df["observation_duration_minutes"] > 0]
+
+        # Aggregate per (date, behavior): count / session duration
+        scc_agg = (
+            scc_df.groupby(["date_only", "behavior"])
+            .agg(count=("behavior", "size"),
+                 minutes=("observation_duration_minutes", "first"))
+            .reset_index()
+        )
+        scc_agg["rate_per_min"] = scc_agg["count"] / scc_agg["minutes"]
+        scc_agg = scc_agg[scc_agg["rate_per_min"] > 0]
+
+        st.markdown(
+            '<div style="background:white;border:1.5px solid #e5e7eb;'
+            'border-radius:12px;padding:16px;margin-top:20px;">'
+            '<div style="font-weight:600;font-size:15px;color:#111;margin-bottom:4px;">'
+            'Standard Celeration Chart</div>'
+            '<div style="font-size:11px;color:#6b7280;margin-bottom:10px;">'
+            'Precision-teaching SCC — y-axis: rate/min (semi-log, 6 cycles 0.001–1000); '
+            'x-axis: calendar days. A straight line = constant celeration (multiplicative rate '
+            'of change per week). Ascending = accelerating; descending = decelerating.'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        if len(scc_agg) < 2 or scc_agg["behavior"].nunique() == 0:
+            st.info(
+                "SCC requires at least 2 sessions with observation_duration_minutes > 0 "
+                "and at least one behavior recorded."
+            )
+        else:
+            fig_scc = _go.Figure()
+            clrs = px.colors.qualitative.Safe
+            min_date = scc_agg["date_only"].min()
+            max_date = scc_agg["date_only"].max()
+            cel_rows = []
+
+            for idx, beh in enumerate(sorted(scc_agg["behavior"].unique())):
+                sub = scc_agg[scc_agg["behavior"] == beh].sort_values("date_only")
+                clr = clrs[idx % len(clrs)]
+
+                fig_scc.add_trace(_go.Scatter(
+                    x=sub["date_only"],
+                    y=sub["rate_per_min"],
+                    mode="markers",
+                    name=beh,
+                    marker=dict(size=9, color=clr, line=dict(width=1, color="white")),
+                    hovertemplate=("<b>" + beh + "</b><br>"
+                                   "Date: %{x|%b %d, %Y}<br>"
+                                   "Rate: %{y:.3f} /min<extra></extra>"),
+                ))
+
+                if len(sub) >= 2:
+                    days = (sub["date_only"] - min_date).dt.days.to_numpy(dtype=float)
+                    log_r = np.log10(sub["rate_per_min"].to_numpy(dtype=float))
+                    if days.max() - days.min() > 0:
+                        slope_day, intercept = np.polyfit(days, log_r, 1)
+                        celeration = float(10 ** (slope_day * 7))
+                        if celeration >= 1.10:
+                            direction = "Accelerating ↗"
+                        elif celeration <= 0.90:
+                            direction = "Decelerating ↘"
+                        else:
+                            direction = "Stable →"
+
+                        x_fit = [sub["date_only"].min(), sub["date_only"].max()]
+                        d_fit = [(d - min_date).days for d in x_fit]
+                        y_fit = [10 ** (intercept + slope_day * d) for d in d_fit]
+                        fig_scc.add_trace(_go.Scatter(
+                            x=x_fit, y=y_fit, mode="lines",
+                            name=f"{beh} celeration ×{celeration:.2f}/wk",
+                            line=dict(color=clr, dash="dash", width=1.5),
+                            hovertemplate=(f"<b>{beh}</b><br>"
+                                           f"Celeration: ×{celeration:.2f} /wk"
+                                           "<extra></extra>"),
+                        ))
+                        cel_rows.append({
+                            "Behavior": beh,
+                            "Celeration (×/wk)": round(celeration, 2),
+                            "Direction": direction,
+                            "Sessions": len(sub),
+                        })
+
+            span_days = max(14, (max_date - min_date).days + 7)
+
+            fig_scc.update_layout(
+                plot_bgcolor="white", paper_bgcolor="white",
+                font_family="system-ui",
+                height=520,
+                xaxis=dict(
+                    title="Calendar Days",
+                    tickformat="%b %d, %Y",
+                    gridcolor="#e5e7eb",
+                    showline=True, linecolor="#9ca3af", mirror=False,
+                ),
+                yaxis=dict(
+                    title="Rate per Minute (log scale)",
+                    type="log",
+                    range=[-3, 3],
+                    gridcolor="#9ca3af",
+                    gridwidth=1,
+                    minor=dict(showgrid=True, gridcolor="#f3f4f6", gridwidth=0.5),
+                    showline=True, linecolor="#9ca3af",
+                ),
+                legend=dict(orientation="h", y=-0.22),
+                margin=dict(l=10, r=10, t=10, b=90),
+            )
+            st.plotly_chart(fig_scc, use_container_width=True, config=_PLOTLY_CONFIG)
+
+            if cel_rows:
+                st.markdown(
+                    '<div style="font-size:11px;font-weight:700;color:#6b7280;'
+                    'text-transform:uppercase;letter-spacing:.05em;margin:8px 0;">'
+                    'Celeration Summary</div>',
+                    unsafe_allow_html=True
+                )
+                st.dataframe(pd.DataFrame(cel_rows), hide_index=True,
+                             use_container_width=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ── Tab: Computational Models ────────────────────────────────────────────────
+def tab_computational_models(filtered_entries, student=""):
+    if not filtered_entries:
+        st.info("No data recorded yet.")
+        return
+    import numpy as np
+    import plotly.graph_objects as _go
+    df = pd.DataFrame(filtered_entries)
+
+    # ── Function Hypothesis Comparison ───────────────────────────────────────
+    if student:
+        ia_all  = load_indirect()
+        ia_data = ia_all.get(student, {})
+
+        saved_fast = ia_data.get("fast", {})
+        saved_mas  = ia_data.get("mas",  {})
+        saved_qfab = ia_data.get("qfab", {})
+        saved_fai  = ia_data.get("fai",  {})
+
+        indirect_scores = {}
+        if saved_fast: indirect_scores["FAST"] = _fast_subscale_scores(saved_fast)
+        if saved_mas:  indirect_scores["MAS"]  = _mas_subscale_scores(saved_mas)
+        if saved_qfab: indirect_scores["QFAB"] = _qfab_function_scores(saved_qfab)
+        if saved_fai:  indirect_scores["FAI"]  = _fai_function_scores(saved_fai)
+
+        if indirect_scores:
+            st.markdown(
+                '<div style="background:white;border:1.5px solid #e5e7eb;border-radius:12px;'
+                'padding:20px;margin-bottom:16px;">'
+                '<div style="font-weight:700;font-size:15px;color:#111;margin-bottom:4px;">'
+                'Function Hypothesis Comparison</div>'
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:14px;">'
+                'Compares informant-rated function (indirect assessment) against '
+                'the empirical signal in the ABC data (antecedent frequency by function category). '
+                'Convergence across sources strengthens the hypothesis; divergence warrants further investigation.</div>',
+                unsafe_allow_html=True
+            )
+
+            functions = ["Attention", "Escape", "Tangible", "Sensory / Automatic"]
+
+            # ── Indirect assessment table ─────────────────────────────────────
+            table_rows = []
+            for inst, scores in indirect_scores.items():
+                total = sum(scores.values()) or 1
+                row = {"Source": inst, "Type": "Indirect"}
+                for fn in functions:
+                    row[fn] = f"{scores.get(fn, 0) / total * 100:.0f}%"
+                row["Top Function"] = max(scores, key=scores.get)
+                table_rows.append(row)
+
+            # ── ABC-derived function signal ───────────────────────────────────
+            _fn_map = {
+                "Attention":           ["(Att)", "Att)"],
+                "Escape":              ["(Esc)", "Esc)"],
+                "Tangible":            ["(Tan)", "Tan)"],
+                "Sensory / Automatic": ["(Sel)", "Sel)"],
+            }
+            if "antecedent" in df.columns:
+                total_abc = len(df)
+                abc_fn_counts = {fn: 0 for fn in functions}
+                for _, row in df.iterrows():
+                    ant = str(row.get("antecedent", "") or "")
+                    for fn, tags in _fn_map.items():
+                        if any(tag in ant for tag in tags):
+                            abc_fn_counts[fn] += 1
+                abc_total = sum(abc_fn_counts.values()) or 1
+                abc_row = {"Source": "ABC Data", "Type": "Direct Observation"}
+                for fn in functions:
+                    abc_row[fn] = f"{abc_fn_counts[fn] / abc_total * 100:.0f}%"
+                abc_row["Top Function"] = max(abc_fn_counts, key=abc_fn_counts.get)
+                table_rows.append(abc_row)
+
+                # ── Convergence callout ───────────────────────────────────────
+                indirect_tops = [max(s, key=s.get) for s in indirect_scores.values()]
+                abc_top = abc_row["Top Function"]
+                n_agree = sum(1 for t in indirect_tops if t == abc_top)
+                n_total = len(indirect_tops)
+                if n_agree == n_total and n_total > 0:
+                    callout_bg, callout_border, callout_color = "#f0fdf4", "#bbf7d0", "#16a34a"
+                    callout_msg = (
+                        f"<b>Convergent:</b> all {n_total} indirect instrument{'s' if n_total>1 else ''} "
+                        f"and the ABC data agree — <b>{abc_top}</b>-maintained behavior. "
+                        f"Hypothesis is well-supported."
+                    )
+                elif n_agree > 0:
+                    callout_bg, callout_border, callout_color = "#fffbeb", "#fde68a", "#92400e"
+                    callout_msg = (
+                        f"<b>Partial convergence:</b> {n_agree} of {n_total} indirect instruments "
+                        f"agree with the ABC data ({abc_top}). "
+                        f"Review divergent instruments before finalising the hypothesis."
+                    )
+                else:
+                    callout_bg, callout_border, callout_color = "#fef2f2", "#fecaca", "#991b1b"
+                    callout_msg = (
+                        f"<b>Divergent:</b> indirect assessment and ABC data suggest different functions. "
+                        f"Indirect: <b>{indirect_tops[0]}</b> — ABC data: <b>{abc_top}</b>. "
+                        f"Additional data collection recommended before concluding function."
+                    )
+
+            st.dataframe(
+                pd.DataFrame(table_rows).set_index("Source"),
+                use_container_width=True
+            )
+
+            if "antecedent" in df.columns:
+                st.markdown(
+                    f'<div style="background:{callout_bg};border:1.5px solid {callout_border};'
+                    f'border-radius:8px;padding:12px 16px;margin-top:8px;font-size:13px;'
+                    f'color:{callout_color};">{callout_msg}</div>',
+                    unsafe_allow_html=True
+                )
+
+            # ── Side-by-side bar chart ────────────────────────────────────────
+            colors = {"Attention": "#6366f1", "Escape": "#f59e0b",
+                      "Tangible": "#10b981", "Sensory / Automatic": "#ef4444"}
+            fig_hyp = _go.Figure()
+            sources = list(indirect_scores.keys())
+            if "antecedent" in df.columns:
+                sources.append("ABC Data")
+            for fn in functions:
+                y_vals = []
+                for src in sources:
+                    if src == "ABC Data":
+                        total = sum(abc_fn_counts.values()) or 1
+                        y_vals.append(round(abc_fn_counts.get(fn, 0) / total * 100, 1))
+                    else:
+                        s = indirect_scores[src]
+                        total = sum(s.values()) or 1
+                        y_vals.append(round(s.get(fn, 0) / total * 100, 1))
+                fig_hyp.add_trace(_go.Bar(
+                    name=fn, x=sources, y=y_vals,
+                    marker_color=colors[fn],
+                    text=[f"{v:.0f}%" for v in y_vals],
+                    textposition="outside",
+                ))
+            fig_hyp.update_layout(
+                barmode="group",
+                plot_bgcolor="white", paper_bgcolor="white",
+                font_family="system-ui", height=320,
+                margin=dict(l=0, r=0, t=10, b=0),
+                yaxis=dict(title="% of total", tickformat="d", range=[0, 110]),
+                xaxis=dict(title=""),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_hyp, use_container_width=True, config=_PLOTLY_CONFIG)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── Reinforcer Gap Analysis ───────────────────────────────────────────
+        saved_reinf = ia_data.get("reinforcers", {})
+        if saved_reinf and "consequence" in df.columns:
+            pr_scores = {label: _likert_score(saved_reinf.get(key, ""), 4)
+                         for key, label, _ in _POS_REINFORCERS}
+            top_reinf = {k: v for k, v in pr_scores.items() if v >= 3}
+
+            if top_reinf:
+                cons_text = " ".join(df["consequence"].dropna().astype(str).str.lower().tolist())
+                gap_items = []
+                used_items = []
+                for label, rating in top_reinf.items():
+                    first_word = label.split("/")[0].split("(")[0].strip().lower().split()[0]
+                    if first_word in cons_text:
+                        used_items.append((label, rating))
+                    else:
+                        gap_items.append((label, rating))
+
+                st.markdown(
+                    '<div style="background:white;border:1.5px solid #e5e7eb;border-radius:12px;'
+                    'padding:20px;margin-bottom:16px;">'
+                    '<div style="font-weight:700;font-size:15px;color:#111;margin-bottom:4px;">'
+                    'Reinforcer Gap Analysis</div>'
+                    '<div style="font-size:12px;color:#6b7280;margin-bottom:14px;">'
+                    'Compares highly-rated reinforcers (3–4 on the inventory) against '
+                    'consequences recorded in the ABC log. Gaps indicate reinforcers that '
+                    'are available but not yet being used as intervention consequences.</div>',
+                    unsafe_allow_html=True
+                )
+                g1, g2 = st.columns(2)
+                with g1:
+                    st.markdown(
+                        '<div style="font-size:12px;font-weight:700;color:#16a34a;margin-bottom:6px;">'
+                        'Appearing in ABC log</div>',
+                        unsafe_allow_html=True
+                    )
+                    if used_items:
+                        for label, rating in used_items:
+                            st.markdown(
+                                f'<div style="font-size:12px;padding:4px 8px;background:#f0fdf4;'
+                                f'border-radius:6px;margin-bottom:3px;">✓ {label} ({rating}/4)</div>',
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.markdown(
+                            '<div style="font-size:12px;color:#9ca3af;">None detected yet.</div>',
+                            unsafe_allow_html=True
+                        )
+                with g2:
+                    st.markdown(
+                        '<div style="font-size:12px;font-weight:700;color:#f59e0b;margin-bottom:6px;">'
+                        'Not yet used as consequence</div>',
+                        unsafe_allow_html=True
+                    )
+                    if gap_items:
+                        for label, rating in gap_items:
+                            st.markdown(
+                                f'<div style="font-size:12px;padding:4px 8px;background:#fffbeb;'
+                                f'border-radius:6px;margin-bottom:3px;">· {label} ({rating}/4)</div>',
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.markdown(
+                            '<div style="font-size:12px;color:#9ca3af;">'
+                            'All highly-rated reinforcers appear in the log.</div>',
+                            unsafe_allow_html=True
+                        )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Computational Models ──────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-weight:700;font-size:15px;color:#111;margin-top:20px;margin-bottom:10px;">'
+        'Computational Models</div>',
+        unsafe_allow_html=True
+    )
+
     # ── Lag Sequential Analysis ───────────────────────────────────────────────
     if "behavior" in df.columns and "date" in df.columns:
         st.markdown(
@@ -2556,13 +4048,6 @@ def tab_summary(filtered_entries):
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Computational Models ──────────────────────────────────────────────────
-    st.markdown(
-        '<div style="font-weight:700;font-size:15px;color:#111;margin-top:20px;margin-bottom:10px;">'
-        'Computational Models</div>',
-        unsafe_allow_html=True
-    )
-
     # 1. Naive Bayes Function Classifier + Bayesian Updating ──────────────────
     with st.expander("Naive Bayes Function Classifier & Bayesian Updating", expanded=False):
         st.markdown(
@@ -2637,185 +4122,7 @@ def tab_summary(filtered_entries):
                 st.plotly_chart(fig_nb, use_container_width=True, config=_PLOTLY_CONFIG)
                 st.dataframe(nb_df, hide_index=True, use_container_width=True)
 
-                # Bayesian updating over time
-                if "date" in df_nb.columns:
-                    st.markdown(
-                        '<div style="font-size:13px;font-weight:600;color:#111;'
-                        'margin-top:16px;margin-bottom:6px;">Bayesian Updating Over Time</div>'
-                        '<div style="font-size:12px;color:#6b7280;margin-bottom:8px;">'
-                        'How confidence in each function evolves as more data is collected.</div>',
-                        unsafe_allow_html=True
-                    )
-                    df_sorted = df_nb.sort_values("date")
-                    alpha = np.ones(4)
-                    history = []
-                    for _, row in df_sorted.iterrows():
-                        v = _entry_func_vector(row)
-                        alpha += np.array([v["Att"], v["Tan"], v["Esc"], v["Sel"]])
-                        p = alpha / alpha.sum()
-                        # 95% credible interval via beta marginals
-                        ci_lo = np.array([max(0, p[i] - 1.96*np.sqrt(p[i]*(1-p[i])/alpha.sum()))
-                                          for i in range(4)])
-                        ci_hi = np.array([min(1, p[i] + 1.96*np.sqrt(p[i]*(1-p[i])/alpha.sum()))
-                                          for i in range(4)])
-                        history.append({
-                            "date": row["date"], "n": int(alpha.sum() - 4),
-                            **{f"p_{f}": round(p[i], 4) for i, f in enumerate(FUNC_TAGS.values())},
-                            **{f"lo_{f}": round(ci_lo[i], 4) for i, f in enumerate(FUNC_TAGS.values())},
-                            **{f"hi_{f}": round(ci_hi[i], 4) for i, f in enumerate(FUNC_TAGS.values())},
-                        })
-                    hist_df = pd.DataFrame(history)
-                    fig_bay = _go.Figure()
-                    for func, color in colors_nb.items():
-                        fig_bay.add_trace(_go.Scatter(
-                            x=hist_df["n"], y=hist_df[f"p_{func}"],
-                            name=func, mode="lines", line=dict(color=color, width=2),
-                        ))
-                        fig_bay.add_trace(_go.Scatter(
-                            x=pd.concat([hist_df["n"], hist_df["n"][::-1]]),
-                            y=pd.concat([hist_df[f"hi_{func}"], hist_df[f"lo_{func}"][::-1]]),
-                            fill="toself", fillcolor=color, opacity=0.15,
-                            line=dict(width=0), showlegend=False, hoverinfo="skip",
-                        ))
-                    fig_bay.update_layout(
-                        plot_bgcolor="white", paper_bgcolor="white",
-                        font_family="system-ui", height=300,
-                        margin=dict(l=0, r=10, t=10, b=0),
-                        xaxis=dict(title="Observations (n)", gridcolor="#e5e7eb"),
-                        yaxis=dict(title="Posterior probability", tickformat=".0%",
-                                   range=[0, 1], gridcolor="#e5e7eb"),
-                        legend=dict(orientation="h", y=1.08),
-                    )
-                    st.plotly_chart(fig_bay, use_container_width=True, config=_PLOTLY_CONFIG)
-            else:
-                st.info("Not enough tagged antecedent/consequence data. Add entries with (Att), (Esc), (Tan), or (Sel) tags in antecedents or consequences.")
-        else:
-            st.info("Antecedent and consequence data required.")
-
     # 2. Hidden Markov Model ───────────────────────────────────────────────────
-    with st.expander("Hidden Markov Model — Behavioral State Inference", expanded=False):
-        st.caption(
-            "Infers hidden behavioral states (Regulated, Escalating, Crisis) from the "
-            "observable sequence of behaviors and intensities. Shows the most likely "
-            "state at each observation and the transition matrix between states. "
-            "A Hidden Markov Model (HMM) is a way to understand behavior when the most important "
-            "parts — the internal states driving behavior — can't be directly observed."
-        )
-        st.markdown("**Core idea**")
-        st.markdown(
-            "- In behavioral analysis, we often see observable actions (e.g., calling out, task refusal), "
-            "but not the underlying state (e.g., frustration, escape motivation, escalation phase).\n"
-            "- An HMM helps infer those hidden states from patterns in what we can observe."
-        )
-        if "behavior" in df.columns and "date" in df.columns:
-            try:
-                from hmmlearn import hmm as _hmm
-
-                df_hmm = df.copy()
-                if "time" in df_hmm.columns:
-                    df_hmm["_sk"] = pd.to_datetime(
-                        df_hmm["date"].astype(str) + " " + df_hmm["time"].astype(str), errors="coerce"
-                    )
-                else:
-                    df_hmm["_sk"] = pd.to_datetime(df_hmm["date"], errors="coerce")
-                df_hmm = df_hmm.sort_values("_sk").dropna(subset=["behavior"])
-
-                # Encode behaviors as integers
-                beh_list_hmm = sorted(df_hmm["behavior"].unique())
-                beh_enc = {b: i for i, b in enumerate(beh_list_hmm)}
-                obs_seq = df_hmm["behavior"].map(beh_enc).values.reshape(-1, 1)
-
-                if len(obs_seq) >= 6:
-                    n_states = min(3, len(obs_seq) // 2)
-                    STATE_NAMES = ["Regulated", "Escalating", "Crisis"][:n_states]
-                    STATE_COLORS = ["#16a34a", "#d97706", "#dc2626"][:n_states]
-
-                    model_hmm = _hmm.CategoricalHMM(
-                        n_components=n_states, n_iter=100, random_state=42
-                    )
-                    model_hmm.fit(obs_seq)
-                    state_seq = model_hmm.predict(obs_seq)
-
-                    # Assign state labels by emission entropy (low entropy = regulated)
-                    emit_entropy = [-np.sum(p * np.log(p + 1e-9))
-                                    for p in model_hmm.emissionprob_]
-                    state_order = np.argsort(emit_entropy)
-                    label_map = {state_order[i]: STATE_NAMES[i] for i in range(n_states)}
-                    color_map = {state_order[i]: STATE_COLORS[i] for i in range(n_states)}
-                    state_labels = [label_map[s] for s in state_seq]
-
-                    # State sequence chart
-                    fig_hmm = _go.Figure()
-                    for state in STATE_NAMES:
-                        mask = [s == state for s in state_labels]
-                        fig_hmm.add_trace(_go.Scatter(
-                            x=df_hmm["_sk"][mask],
-                            y=[state] * sum(mask),
-                            mode="markers",
-                            name=state,
-                            marker=dict(
-                                color=STATE_COLORS[STATE_NAMES.index(state)],
-                                size=12, symbol="circle",
-                            ),
-                            text=df_hmm["behavior"][mask],
-                            hovertemplate="<b>%{text}</b><br>%{x}<extra></extra>",
-                        ))
-                    fig_hmm.update_layout(
-                        plot_bgcolor="white", paper_bgcolor="white",
-                        font_family="system-ui", height=260,
-                        margin=dict(l=0, r=10, t=10, b=0),
-                        xaxis=dict(title="Time", gridcolor="#e5e7eb"),
-                        yaxis=dict(title="Inferred State", automargin=True,
-                                   categoryorder="array",
-                                   categoryarray=list(reversed(STATE_NAMES))),
-                        legend=dict(orientation="h", y=1.1),
-                    )
-                    st.plotly_chart(fig_hmm, use_container_width=True, config=_PLOTLY_CONFIG)
-
-                    # Transition matrix
-                    trans_mat = model_hmm.transmat_
-                    reordered = [list(STATE_NAMES).index(label_map[i])
-                                 for i in range(n_states)]
-                    t_reord = trans_mat[np.ix_(state_order, state_order)]
-                    t_text = [[f"{v:.2f}" for v in row] for row in t_reord.tolist()]
-
-                    fig_trans = _go.Figure(data=_go.Heatmap(
-                        z=t_reord.tolist(), x=STATE_NAMES, y=STATE_NAMES,
-                        text=t_text, texttemplate="%{text}",
-                        textfont=dict(size=14, color="#111"),
-                        colorscale=[[0,"#ffffff"],[0.5,"#fde68a"],[1,"#dc2626"]],
-                        showscale=False, zmin=0, zmax=1,
-                        hovertemplate="From <b>%{y}</b> → <b>%{x}</b>: %{z:.2f}<extra></extra>",
-                    ))
-                    fig_trans.update_layout(
-                        plot_bgcolor="white", paper_bgcolor="white",
-                        font_family="system-ui", height=260,
-                        margin=dict(l=0, r=0, t=30, b=0),
-                        xaxis=dict(title="To state", domain=[0.22, 1.0]),
-                        yaxis=dict(title="From state", domain=[0.15, 1.0], automargin=True),
-                        title=dict(text="State Transition Probabilities", font=dict(size=13)),
-                    )
-                    st.plotly_chart(fig_trans, use_container_width=True, config=_PLOTLY_CONFIG)
-
-                    # Most common transition
-                    np.fill_diagonal(t_reord, 0)
-                    peak_from, peak_to = np.unravel_index(t_reord.argmax(), t_reord.shape)
-                    st.markdown(
-                        f'<div style="font-size:12px;color:#374151;background:#f9fafb;'
-                        f'border-radius:6px;padding:10px 14px;">'
-                        f'Most likely escalation path: <b>{STATE_NAMES[peak_from]}</b> → '
-                        f'<b>{STATE_NAMES[peak_to]}</b> '
-                        f'(p = {t_reord[peak_from, peak_to]:.2f})</div>',
-                        unsafe_allow_html=True
-                    )
-                else:
-                    st.info("At least 6 behavior observations are needed for HMM.")
-            except Exception as e:
-                st.warning(f"HMM unavailable: {e}")
-        else:
-            st.info("Behavior and date data required.")
-
-    # 3. ARIMA Forecast ────────────────────────────────────────────────────────
     with st.expander("Autoregressive Model (ARIMA) — Behavior Frequency Forecast", expanded=False):
         st.markdown(
             '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
@@ -2885,15 +4192,15 @@ def tab_summary(filtered_entries):
                         xaxis=dict(title="Date", gridcolor="#e5e7eb",
                                    tickformat="%b %d"),
                         yaxis=dict(title="Daily count", gridcolor="#e5e7eb",
-                                   rangemode="nonnegative"),
+                                   rangemode="nonnegative", tickformat="d"),
                         legend=dict(orientation="h", y=1.08),
                     )
                     st.plotly_chart(fig_ar, use_container_width=True, config=_PLOTLY_CONFIG)
                     st.markdown(
                         f'<div style="font-size:12px;color:#374151;background:#f9fafb;'
                         f'border-radius:6px;padding:10px 14px;">'
-                        f'7-day forecast mean: <b>{fc_mean.mean():.1f}</b> behaviors/day '
-                        f'(95% CI: {fc_ci.iloc[:,0].mean():.1f}–{fc_ci.iloc[:,1].mean():.1f}). '
+                        f'7-day forecast mean: <b>{fc_mean.mean():.0f}</b> behaviors/day '
+                        f'(95% CI: {fc_ci.iloc[:,0].mean():.0f}–{fc_ci.iloc[:,1].mean():.0f}). '
                         f'Shaded region shows uncertainty range.</div>',
                         unsafe_allow_html=True
                     )
@@ -2905,237 +4212,530 @@ def tab_summary(filtered_entries):
             st.info("Behavior and date data required.")
 
     # 4. Behavioral Network Graph ─────────────────────────────────────────────
-    with st.expander("Behavioral Network Graph", expanded=False):
+    with st.expander("Regression Analysis — Behavior Predictors", expanded=False):
         st.markdown(
-            '<div style="font-size:12px;color:#6b7280;margin-bottom:16px;">'
-            'Treats behaviors as nodes and transitions as directed edges. '
-            'Node size = frequency. Edge thickness = transition strength. '
-            'Hub behaviors (high in-degree + out-degree) are likely to trigger cascades. '
-            'A pivot behavior is a critical link within a behavior chain that both receives input from multiple antecedents '
-            'and leads to multiple subsequent behaviors. Unlike a general hub (which simply has many connections), '
-            'a pivot plays a strategic role in driving progression between behaviors, often toward escalation.'
-            '<br><br>'
-            'For example, <i>Calling Out</i> may be triggered by different preceding behaviors and, once it occurs, '
-            'consistently leads toward more severe outcomes — making it a key leverage point for intervention.'
-            '<br><br>'
-            '<b>Why this is important in FBA:</b>'
-            '<ul style="margin:6px 0 6px 16px;padding:0;">'
-            '<li>Addressing a pivot can disrupt several behavior pathways simultaneously</li>'
-            '<li>It allows intervention earlier in the chain, when redirection is more feasible</li>'
-            '<li>It represents an efficient target compared to focusing only on end-stage behaviors (e.g., aggression)</li>'
-            '<li>In network graphs, high-centrality (red) nodes often signal likely pivot behaviors</li>'
-            '</ul>'
-            '<b>In essence:</b> Pivot behaviors are high-impact intervention points that allow practitioners to prevent '
-            'escalation by intervening at a critical moment in the behavioral sequence.</div>',
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Uses logistic and linear regression to identify which antecedents, consequences, '
+            'settings, time-of-day, and day-of-week are the strongest predictors of each behavior. '
+            'Coefficients show direction and magnitude of each predictor\'s effect.</div>',
             unsafe_allow_html=True
         )
-        if "behavior" in df.columns and "date" in df.columns:
-            try:
-                import networkx as _nx
-
-                # Build transition counts (reuse lag-1 logic)
-                df_net = df.copy()
-                if "time" in df_net.columns:
-                    df_net["_sk"] = pd.to_datetime(
-                        df_net["date"].astype(str) + " " + df_net["time"].astype(str), errors="coerce"
-                    )
-                else:
-                    df_net["_sk"] = pd.to_datetime(df_net["date"], errors="coerce")
-                df_net = df_net.sort_values("_sk")
-                session_cols_net = ["date"] + (["setting"] if "setting" in df_net.columns else [])
-
-                net_seq = []
-                for _, grp in df_net.groupby(session_cols_net, sort=False):
-                    net_seq.extend(list(grp["behavior"].dropna()))
-                    net_seq.append(None)
-
-                edge_counts = {}
-                node_freq = df_net["behavior"].value_counts().to_dict()
-                for i in range(len(net_seq) - 1):
-                    a, b = net_seq[i], net_seq[i+1]
-                    if a and b and a != b:
-                        edge_counts[(a, b)] = edge_counts.get((a, b), 0) + 1
-
-                if edge_counts:
-                    G = _nx.DiGraph()
-                    for beh, freq in node_freq.items():
-                        G.add_node(beh, freq=freq)
-                    for (a, b), w in edge_counts.items():
-                        G.add_edge(a, b, weight=w)
-
-                    # Layout
-                    pos = _nx.spring_layout(G, seed=42, k=2.5)
-
-                    max_freq = max(node_freq.values())
-                    max_edge = max(edge_counts.values())
-
-                    # Identify hub nodes (top by degree centrality)
-                    centrality = _nx.degree_centrality(G)
-                    hub_threshold = np.percentile(list(centrality.values()), 66)
-
-                    fig_net = _go.Figure()
-
-                    # Edges
-                    for (a, b), w in edge_counts.items():
-                        x0, y0 = pos[a]
-                        x1, y1 = pos[b]
-                        alpha = 0.3 + 0.5 * (w / max_edge)
-                        fig_net.add_trace(_go.Scatter(
-                            x=[x0, x1, None], y=[y0, y1, None],
-                            mode="lines",
-                            line=dict(width=1 + 3 * (w / max_edge), color=f"rgba(100,100,100,{alpha:.2f})"),
-                            hoverinfo="none", showlegend=False,
-                        ))
-
-                    # Nodes
-                    for beh in G.nodes():
-                        x, y = pos[beh]
-                        freq = node_freq.get(beh, 1)
-                        is_hub = centrality[beh] >= hub_threshold
-                        color = "#dc2626" if is_hub else "#4f6ef7"
-                        size = 20 + 30 * (freq / max_freq)
-                        fig_net.add_trace(_go.Scatter(
-                            x=[x], y=[y], mode="markers+text",
-                            text=[beh], textposition="top center",
-                            textfont=dict(size=11, color="#111"),
-                            marker=dict(size=size, color=color,
-                                        line=dict(width=2, color="white")),
-                            name="Hub" if is_hub else "Behavior",
-                            hovertemplate=f"<b>{beh}</b><br>Frequency: {freq}<br>"
-                                          f"Centrality: {centrality[beh]:.2f}<extra></extra>",
-                            showlegend=False,
-                        ))
-
-                    fig_net.update_layout(
-                        plot_bgcolor="white", paper_bgcolor="white",
-                        font_family="system-ui", height=480,
-                        margin=dict(l=20, r=20, t=20, b=20),
-                        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                    )
-                    st.plotly_chart(fig_net, use_container_width=True, config=_PLOTLY_CONFIG)
-
-                    # Hub summary
-                    hubs = sorted([b for b in G.nodes() if centrality[b] >= hub_threshold],
-                                  key=lambda b: -centrality[b])
-                    if hubs:
-                        st.markdown(
-                            '<div style="font-size:12px;color:#374151;background:#fef2f2;'
-                            'border:1px solid #fecaca;border-radius:6px;padding:10px 14px;">'
-                            '<b>Hub behaviors</b> (red nodes — highest transition centrality): '
-                            + ", ".join(f"<b>{h}</b>" for h in hubs) +
-                            '. These behaviors are most connected to others and may act as '
-                            'triggers or pivots in behavioral chains.</div>',
-                            unsafe_allow_html=True
-                        )
-                else:
-                    st.info("At least 2 behavior transitions needed for the network graph.")
-            except Exception as e:
-                st.warning(f"Network graph unavailable: {e}")
+        if "behavior" not in df.columns or len(df) < 10:
+            st.info("At least 10 entries are needed for regression analysis.")
         else:
-            st.info("Behavior and date data required.")
+            import re as _re_reg
+            from scipy import stats as _stats
 
-    # ── AI Pattern Analysis ───────────────────────────────────────────────────
-    st.markdown(
-        '<div style="background:white;border:1.5px solid #e5e7eb;border-radius:12px;'
-        'padding:20px;margin-top:16px;">'
-        '<div style="font-weight:700;font-size:15px;color:#111;margin-bottom:4px;">AI Pattern Analysis</div>'
-        '<div style="font-size:12px;color:#6b7280;margin-bottom:14px;">'
-        'Analyzes all data above — setting fields, ABC fields, behavior dimensions, trends, and function.</div>',
-        unsafe_allow_html=True
-    )
+            df_reg = df.copy()
 
-    if not _ANTHROPIC_AVAILABLE:
-        st.warning("Install the `anthropic` package to enable AI analysis: `pip install anthropic`")
-    else:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            api_key = st.text_input(
-                "Anthropic API Key", type="password",
-                placeholder="sk-ant-...",
-                help="Enter your Anthropic API key. It is not stored.",
-                key="ai_api_key_input"
-            )
-
-        if st.button("Run AI Analysis", type="primary", key="ai_analyze_btn"):
-            if not api_key:
-                st.warning("An API key is required to run analysis.")
+            # ── Feature engineering ──────────────────────────────────────────
+            # Time of day → hour (numeric)
+            if "time" in df_reg.columns:
+                df_reg["_hour"] = pd.to_datetime(df_reg["time"], format="%H:%M", errors="coerce").dt.hour
             else:
-                # Build a structured data summary to send to the model
-                summary_parts = []
+                df_reg["_hour"] = np.nan
 
-                summary_parts.append(f"Student data summary ({len(df)} entries):")
-                summary_parts.append(f"- Date range: {df['date'].min()} to {df['date'].max()}" if "date" in df.columns else "")
+            # Day of week (0=Mon … 6=Sun)
+            if "date" in df_reg.columns:
+                df_reg["_dow"] = pd.to_datetime(df_reg["date"], errors="coerce").dt.dayofweek
 
-                if "behavior" in df.columns:
-                    beh_counts = df["behavior"].value_counts()
-                    summary_parts.append("Behavior frequencies: " + ", ".join(f"{b} ({n})" for b, n in beh_counts.items()))
+            # One-hot encode antecedent, consequence, setting (top-N only to keep it readable)
+            _TOP_N = 6
+            feature_cols = []
+            for col, prefix in [("antecedent", "Ant"), ("consequence", "Con"), ("setting", "Set")]:
+                if col in df_reg.columns:
+                    top_vals = df_reg[col].value_counts().head(_TOP_N).index.tolist()
+                    for val in top_vals:
+                        safe = _re_reg.sub(r"[^A-Za-z0-9]", "_", str(val))[:20]
+                        col_name = f"{prefix}_{safe}"
+                        df_reg[col_name] = (df_reg[col] == val).astype(int)
+                        feature_cols.append(col_name)
 
-                if "antecedent" in df.columns:
-                    ant_counts = df["antecedent"].value_counts()
-                    summary_parts.append("Antecedent frequencies: " + ", ".join(f"{a} ({n})" for a, n in ant_counts.items()))
+            if "_hour" in df_reg.columns and df_reg["_hour"].notna().sum() > 0:
+                feature_cols.append("_hour")
+            if "_dow" in df_reg.columns and df_reg["_dow"].notna().sum() > 0:
+                feature_cols.append("_dow")
 
-                if "consequence" in df.columns:
-                    con_counts = df["consequence"].value_counts()
-                    summary_parts.append("Consequence frequencies: " + ", ".join(f"{c} ({n})" for c, n in con_counts.items()))
-
-                for field, label in [("location","Location"),("people_intervening","People Intervening"),
-                                     ("subject","Subject"),("activity","Activity"),
-                                     ("instructional_format","Instructional Format")]:
-                    if field in df.columns and df[field].notna().any():
-                        counts = df[field].value_counts()
-                        summary_parts.append(f"{label}: " + ", ".join(f"{v} ({n})" for v, n in counts.items()))
-
-                if "intensity" in df.columns and df["intensity"].notna().any():
-                    summary_parts.append(f"Average intensity: {df['intensity'].mean():.1f}/10")
-
-                if "date" in df.columns:
-                    df["_dow"] = pd.to_datetime(df["date"]).dt.day_name()
-                    dow = df["_dow"].value_counts()
-                    summary_parts.append("Behavior by day of week: " + ", ".join(f"{d} ({n})" for d, n in dow.items()))
-
-                if "time" in df.columns and df["time"].notna().any():
-                    try:
-                        df["_hour"] = pd.to_datetime(df["time"], format="%H:%M:%S", errors="coerce").dt.hour
-                        hour_counts = df["_hour"].dropna().value_counts().sort_index()
-                        if len(hour_counts):
-                            summary_parts.append("Behavior by hour: " + ", ".join(f"{int(h):02d}:00 ({n})" for h, n in hour_counts.items()))
-                    except Exception:
-                        pass
-
-                data_text = "\n".join(p for p in summary_parts if p)
-
-                prompt = (
-                    "You are a Board Certified Behavior Analyst (BCBA) reviewing ABC (Antecedent-Behavior-Consequence) "
-                    "data collected on a student. Analyze the following data and identify meaningful patterns, "
-                    "hypotheses about behavior function, notable antecedent-behavior-consequence chains, "
-                    "time/setting patterns, and any clinical observations that would be useful for an FBA report. "
-                    "Be specific and reference the actual data values. Organize your response with clear headings.\n\n"
-                    + data_text
+            if not feature_cols:
+                st.info("No antecedent, consequence, or setting data available for regression.")
+            else:
+                behaviors_reg = sorted(df_reg["behavior"].dropna().unique())
+                selected_beh = st.selectbox(
+                    "Select behavior to model", behaviors_reg, key="reg_beh_sel"
                 )
 
-                with st.spinner("Analyzing data…"):
-                    try:
-                        client = _anthropic.Anthropic(api_key=api_key)
-                        message = client.messages.create(
-                            model="claude-opus-4-6",
-                            max_tokens=1024,
-                            messages=[{"role": "user", "content": prompt}]
-                        )
-                        result = message.content[0].text
-                        st.session_state["ai_analysis_result"] = result
-                    except Exception as e:
-                        st.error(f"Analysis failed: {e}")
+                df_reg["_target"] = (df_reg["behavior"] == selected_beh).astype(int)
+                df_model = df_reg[feature_cols + ["_target"]].dropna()
 
-        if st.session_state.get("ai_analysis_result"):
-            st.markdown(
-                '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;'
-                'padding:16px;margin-top:12px;font-size:14px;line-height:1.7;color:#111;">'
-                + st.session_state["ai_analysis_result"].replace("\n", "<br>") + '</div>',
-                unsafe_allow_html=True
+                if len(df_model) < 10 or df_model["_target"].sum() < 3:
+                    st.info("Not enough occurrences of this behavior for regression (need ≥ 3 positive cases and ≥ 10 rows).")
+                else:
+                    X = df_model[feature_cols].values.astype(float)
+                    y = df_model["_target"].values.astype(float)
+
+                    # Standardise numeric cols (_hour, _dow) for comparable coefficients
+                    X_scaled = X.copy()
+                    for j, fc in enumerate(feature_cols):
+                        if fc in ("_hour", "_dow"):
+                            std = X_scaled[:, j].std()
+                            if std > 0:
+                                X_scaled[:, j] = (X_scaled[:, j] - X_scaled[:, j].mean()) / std
+
+                    # Add intercept
+                    X_int = np.column_stack([np.ones(len(X_scaled)), X_scaled])
+
+                    # Logistic regression via gradient descent (no sklearn dependency)
+                    def _sigmoid(z):
+                        return 1 / (1 + np.exp(-np.clip(z, -500, 500)))
+
+                    def _logistic_fit(X, y, lr=0.05, iters=500):
+                        w = np.zeros(X.shape[1])
+                        for _ in range(iters):
+                            pred = _sigmoid(X @ w)
+                            grad = X.T @ (pred - y) / len(y)
+                            w -= lr * grad
+                        return w
+
+                    try:
+                        w = _logistic_fit(X_int, y)
+                        coefs = w[1:]  # drop intercept
+
+                        # Approximate standard errors via Hessian diagonal
+                        pred = _sigmoid(X_int @ w)
+                        W_diag = pred * (1 - pred)
+                        XtWX = X_int.T @ np.diag(W_diag) @ X_int
+                        cov = np.linalg.pinv(XtWX)
+                        se = np.sqrt(np.diag(cov)[1:])
+                        z_scores = coefs / np.where(se > 0, se, 1e-9)
+                        p_vals = 2 * (1 - _stats.norm.cdf(np.abs(z_scores)))
+
+                        # Pretty labels
+                        label_map = {"_hour": "Time of Day (hour)", "_dow": "Day of Week"}
+                        labels = [label_map.get(fc, fc.replace("_", " ")) for fc in feature_cols]
+
+                        reg_df = pd.DataFrame({
+                            "Predictor": labels,
+                            "Coefficient (log-odds)": np.round(coefs, 3),
+                            "Std Error": np.round(se, 3),
+                            "z": np.round(z_scores, 2),
+                            "p-value": np.round(p_vals, 4),
+                            "Significant": ["✓" if p < 0.05 else "" for p in p_vals],
+                        }).sort_values("Coefficient (log-odds)", key=abs, ascending=False)
+
+                        # Bar chart of coefficients
+                        colors_reg = ["#16a34a" if c > 0 else "#dc2626"
+                                      for c in reg_df["Coefficient (log-odds)"]]
+                        fig_reg = _go.Figure(_go.Bar(
+                            x=reg_df["Predictor"],
+                            y=reg_df["Coefficient (log-odds)"],
+                            marker_color=colors_reg,
+                            hovertemplate="<b>%{x}</b><br>Coef: %{y:.3f}<extra></extra>",
+                        ))
+                        fig_reg.add_hline(y=0, line_color="#9ca3af", line_width=1)
+                        fig_reg.update_layout(
+                            plot_bgcolor="white", paper_bgcolor="white",
+                            font_family="system-ui", height=320,
+                            margin=dict(l=0, r=0, t=10, b=0),
+                            xaxis=dict(tickangle=-35, automargin=True),
+                            yaxis=dict(title="Log-odds coefficient", gridcolor="#e5e7eb"),
+                        )
+                        st.plotly_chart(fig_reg, use_container_width=True, config=_PLOTLY_CONFIG)
+                        st.dataframe(reg_df, hide_index=True, use_container_width=True)
+
+                        st.markdown(
+                            '<div style="font-size:11px;color:#9ca3af;margin-top:8px;">'
+                            'Logistic regression with log-odds coefficients. '
+                            'Positive = predictor increases likelihood of this behavior; '
+                            'negative = decreases likelihood. '
+                            '✓ = significant at p &lt; .05. '
+                            'Antecedent/consequence/setting features one-hot encoded; '
+                            'hour and day-of-week standardized.</div>',
+                            unsafe_allow_html=True
+                        )
+                    except Exception as _reg_err:
+                        st.warning(f"Regression could not be computed: {_reg_err}")
+
+    # ── Motivating Operations Analysis ───────────────────────────────────────
+    with st.expander("Motivating Operations Analysis", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Shows which motivating operations co-occur most frequently with each behavior '
+            'and whether behavior rate is significantly higher on sessions when each MO is present. '
+            'Only entries with MO data recorded are included.</div>',
+            unsafe_allow_html=True
+        )
+
+        # Build MO-enriched dataframe
+        mo_entries = [e for e in filtered_entries if e.get("motivating_operations")]
+        if len(mo_entries) < 5:
+            st.info("At least 5 entries with MO data are needed. Open the ⚡ Motivating Operations section in the New ABC Entry form to start recording.")
+        else:
+            df_mo = pd.DataFrame(filtered_entries)
+            df_mo_only = pd.DataFrame(mo_entries)
+
+            # Build a flat label lookup from MO_DEFAULTS
+            _mo_label = {}
+            for _dom, _items in MO_DEFAULTS.items():
+                for _m in _items:
+                    _mo_label[_m["key"]] = _m["label"][:55] + "…" if len(_m["label"]) > 55 else _m["label"]
+
+            # Expand MO dicts into binary columns
+            all_mo_keys = set()
+            for e in mo_entries:
+                all_mo_keys.update(e.get("motivating_operations", {}).keys())
+            all_mo_keys = sorted(all_mo_keys)
+
+            for mk in all_mo_keys:
+                df_mo[mk] = df_mo["motivating_operations"].apply(
+                    lambda d: bool(d.get(mk)) if isinstance(d, dict) else False
+                )
+
+            behaviors_mo = sorted(df_mo["behavior"].dropna().unique())
+            sel_beh_mo = st.selectbox("Select behavior", behaviors_mo, key="mo_beh_sel")
+
+            beh_mask_mo = df_mo["behavior"] == sel_beh_mo
+            total_mo = len(df_mo)
+
+            rows_mo = []
+            for mk in all_mo_keys:
+                if mk not in df_mo.columns:
+                    continue
+                mo_present = df_mo[mk].astype(bool)
+                n_present  = mo_present.sum()
+                n_absent   = total_mo - n_present
+                if n_present < 2:
+                    continue
+
+                rate_present = (beh_mask_mo & mo_present).sum() / n_present
+                rate_absent  = (beh_mask_mo & ~mo_present).sum() / n_absent if n_absent > 0 else 0
+                diff = rate_present - rate_absent
+
+                label = _mo_label.get(mk, mk.replace("_", " ").title())
+                rows_mo.append({
+                    "Motivating Operation": label,
+                    "Rate w/ MO": round(rate_present, 3),
+                    "Rate w/o MO": round(rate_absent, 3),
+                    "Difference": round(diff, 3),
+                    "n (MO present)": int(n_present),
+                })
+
+            if not rows_mo:
+                st.info("Not enough MO variation in the data yet.")
+            else:
+                mo_df = pd.DataFrame(rows_mo).sort_values("Difference", ascending=False)
+
+                # Bar chart
+                bar_colors_mo = ["#16a34a" if d > 0 else "#dc2626" for d in mo_df["Difference"]]
+                fig_mo = _go.Figure(_go.Bar(
+                    x=mo_df["Motivating Operation"],
+                    y=mo_df["Difference"],
+                    marker_color=bar_colors_mo,
+                    text=[f"{v:+.2f}" for v in mo_df["Difference"]],
+                    textposition="outside",
+                    hovertemplate=(
+                        "<b>%{x}</b><br>"
+                        "Rate w/ MO: %{customdata[0]:.3f}<br>"
+                        "Rate w/o MO: %{customdata[1]:.3f}<br>"
+                        "Diff: %{y:+.3f}<extra></extra>"
+                    ),
+                    customdata=mo_df[["Rate w/ MO", "Rate w/o MO"]].values,
+                ))
+                fig_mo.add_hline(y=0, line_color="#9ca3af", line_width=1)
+                fig_mo.update_layout(
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    font_family="system-ui", height=340,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    xaxis=dict(tickangle=-35, automargin=True),
+                    yaxis=dict(title="Behavior rate difference", gridcolor="#e5e7eb",
+                               tickformat=".2f"),
+                )
+                st.plotly_chart(fig_mo, use_container_width=True, config=_PLOTLY_CONFIG)
+                st.dataframe(mo_df, hide_index=True, use_container_width=True)
+
+                # Plain-language summary
+                top_mo = mo_df.iloc[0]
+                if top_mo["Difference"] > 0.05:
+                    st.markdown(
+                        f'<div style="font-size:12px;color:#374151;background:#f0fdf4;'
+                        f'border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;margin-top:6px;">'
+                        f'<b>Strongest MO predictor:</b> <i>{top_mo["Motivating Operation"]}</i> — '
+                        f'{sel_beh_mo} occurs at a rate of <b>{top_mo["Rate w/ MO"]:.0%}</b> when '
+                        f'this condition is present vs. <b>{top_mo["Rate w/o MO"]:.0%}</b> when absent '
+                        f'(Δ = {top_mo["Difference"]:+.2f}).</div>',
+                        unsafe_allow_html=True
+                    )
+
+                st.markdown(
+                    '<div style="font-size:11px;color:#9ca3af;margin-top:8px;">'
+                    'Positive difference = MO present is associated with higher behavior rate. '
+                    'Based only on entries where MO data was recorded.</div>',
+                    unsafe_allow_html=True
+                )
+
+    # ── Conditional Probability Analysis ─────────────────────────────────────
+    with st.expander("Conditional Probability Analysis", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Compares <b>P(behavior | antecedent present)</b> vs. '
+            '<b>P(behavior | antecedent absent)</b> for each antecedent-behavior pair. '
+            'A large difference between these two probabilities is strong evidence that '
+            'the antecedent is a reliable predictor — directly informing function hypotheses.</div>',
+            unsafe_allow_html=True
+        )
+        if "antecedent" not in df.columns or "behavior" not in df.columns or len(df) < 5:
+            st.info("At least 5 entries with antecedent and behavior data are needed.")
+        else:
+            from scipy import stats as _cpa_stats
+
+            behaviors_cpa = sorted(df["behavior"].dropna().unique())
+            antecedents_cpa = sorted(df["antecedent"].dropna().unique())
+            antecedents_cpa = [a for a in antecedents_cpa if a != ""]
+
+            sel_beh_cpa = st.selectbox(
+                "Select behavior", behaviors_cpa, key="cpa_beh_sel"
             )
 
-    st.markdown("</div>", unsafe_allow_html=True)
+            rows_cpa = []
+            total_n = len(df)
+            beh_mask = df["behavior"] == sel_beh_cpa
+
+            for ant in antecedents_cpa:
+                ant_mask   = df["antecedent"] == ant
+                n_ant      = ant_mask.sum()
+                n_no_ant   = total_n - n_ant
+                if n_ant == 0:
+                    continue
+
+                # P(beh | ant present)
+                p_given    = (beh_mask & ant_mask).sum() / n_ant
+                # P(beh | ant absent)
+                p_absent   = (beh_mask & ~ant_mask).sum() / n_no_ant if n_no_ant > 0 else 0
+
+                # Fisher's exact test for significance
+                a = (beh_mask & ant_mask).sum()
+                b = n_ant - a
+                c = (beh_mask & ~ant_mask).sum()
+                d = n_no_ant - c
+                _, p_val = _cpa_stats.fisher_exact([[a, b], [c, d]])
+
+                diff = p_given - p_absent
+                rows_cpa.append({
+                    "Antecedent": ant,
+                    "P(beh | ant)": round(p_given, 3),
+                    "P(beh | no ant)": round(p_absent, 3),
+                    "Difference": round(diff, 3),
+                    "n (ant present)": int(n_ant),
+                    "p-value": round(p_val, 4),
+                    "Significant": "✓" if p_val < 0.05 else "",
+                })
+
+            if not rows_cpa:
+                st.info("Not enough antecedent data for this behavior.")
+            else:
+                cpa_df = pd.DataFrame(rows_cpa).sort_values("Difference", ascending=False)
+
+                # Bar chart — difference scores
+                bar_colors = ["#16a34a" if d > 0 else "#dc2626"
+                              for d in cpa_df["Difference"]]
+                fig_cpa = _go.Figure(_go.Bar(
+                    x=cpa_df["Antecedent"],
+                    y=cpa_df["Difference"],
+                    marker_color=bar_colors,
+                    text=[f"{v:+.2f}" for v in cpa_df["Difference"]],
+                    textposition="outside",
+                    hovertemplate=(
+                        "<b>%{x}</b><br>"
+                        "P(beh|ant): %{customdata[0]:.3f}<br>"
+                        "P(beh|no ant): %{customdata[1]:.3f}<br>"
+                        "Diff: %{y:+.3f}<extra></extra>"
+                    ),
+                    customdata=cpa_df[["P(beh | ant)", "P(beh | no ant)"]].values,
+                ))
+                fig_cpa.add_hline(y=0, line_color="#9ca3af", line_width=1)
+                fig_cpa.update_layout(
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    font_family="system-ui", height=320,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    xaxis=dict(tickangle=-35, automargin=True),
+                    yaxis=dict(title="P(beh|ant) − P(beh|no ant)",
+                               gridcolor="#e5e7eb", tickformat=".2f"),
+                )
+                st.plotly_chart(fig_cpa, use_container_width=True, config=_PLOTLY_CONFIG)
+                st.dataframe(cpa_df, hide_index=True, use_container_width=True)
+
+                # Highlight top predictor
+                top = cpa_df.iloc[0]
+                if top["Difference"] > 0.1:
+                    st.markdown(
+                        f'<div style="font-size:12px;color:#374151;background:#f0fdf4;'
+                        f'border:1px solid #bbf7d0;border-radius:6px;padding:10px 14px;margin-top:4px;">'
+                        f'<b>Strongest predictor:</b> <b>{top["Antecedent"]}</b> — '
+                        f'{sel_beh_cpa} occurs in <b>{top["P(beh | ant)"]:.0%}</b> of observations '
+                        f'when this antecedent is present vs. '
+                        f'<b>{top["P(beh | no ant)"]:.0%}</b> when absent '
+                        f'(Δ = {top["Difference"]:+.2f}'
+                        f'{", p < .05" if top["Significant"] == "✓" else ""}).</div>',
+                        unsafe_allow_html=True
+                    )
+                st.markdown(
+                    '<div style="font-size:11px;color:#9ca3af;margin-top:8px;">'
+                    'Significance tested with Fisher\'s exact test. '
+                    'Positive difference = antecedent increases behavior likelihood; '
+                    'negative = decreases. ✓ = significant at p &lt; .05.</div>',
+                    unsafe_allow_html=True
+                )
+
+    # ── FBA Scatter Plot (Touchette et al., 1985) ─────────────────────────────
+    with st.expander("FBA Scatter Plot (Touchette Format)", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Maps behavior occurrences across time slots (rows) and individual '
+            'session dates (columns). Filled cells indicate the behavior occurred during '
+            'that slot on that date. Identifies predictable time patterns at the session level. '
+            'Slot size is adjustable (15 min / 30 min / 1 hour). '
+            '<i>Touchette et al. (1985)</i></div>',
+            unsafe_allow_html=True
+        )
+        if "time" not in df.columns or "date" not in df.columns or "behavior" not in df.columns:
+            st.info("Time, date, and behavior data are all required for scatter plot analysis.")
+        else:
+            behaviors_sp = sorted(df["behavior"].dropna().unique())
+            sel_beh_sp = st.selectbox(
+                "Select behavior", behaviors_sp, key="sp_beh_sel"
+            )
+
+            slot_label_map = {
+                "15 minutes": 15,
+                "30 minutes": 30,
+                "1 hour":     60,
+            }
+            slot_choice = st.radio(
+                "Time slot size",
+                options=list(slot_label_map.keys()),
+                index=1,
+                horizontal=True,
+                key="sp_slot"
+            )
+            slot_mins = slot_label_map[slot_choice]
+
+            df_sp = df[df["behavior"] == sel_beh_sp].copy()
+            df_sp["_date"] = pd.to_datetime(df_sp["date"], errors="coerce").dt.date
+            df_sp = df_sp.dropna(subset=["_date"])
+
+            def _to_slot(t, mins):
+                try:
+                    h, m = int(str(t).split(":")[0]), int(str(t).split(":")[1])
+                    slot_num = (h * 60 + m) // mins
+                    start_h  = (slot_num * mins) // 60
+                    start_m  = (slot_num * mins) % 60
+                    end_tot  = slot_num * mins + mins
+                    end_h    = end_tot // 60
+                    end_m    = end_tot % 60
+                    return (
+                        slot_num,
+                        f"{start_h}:{'%02d'%start_m}–{end_h}:{'%02d'%end_m}"
+                    )
+                except Exception:
+                    return (None, None)
+
+            df_sp[["_slot_num", "_slot_label"]] = df_sp["time"].apply(
+                lambda t: pd.Series(_to_slot(t, slot_mins))
+            )
+            df_sp = df_sp.dropna(subset=["_slot_num"])
+            df_sp["_slot_num"] = df_sp["_slot_num"].astype(int)
+
+            if len(df_sp) == 0:
+                st.info("No time data recorded for this behavior.")
+            else:
+                # Build grid
+                all_dates  = sorted(df_sp["_date"].unique())
+                slot_info  = df_sp[["_slot_num", "_slot_label"]].drop_duplicates().sort_values("_slot_num")
+                all_slots  = slot_info["_slot_num"].tolist()
+                slot_labels= slot_info["_slot_label"].tolist()
+
+                # Count occurrences per (date, slot)
+                occ = df_sp.groupby(["_date", "_slot_num"]).size().reset_index(name="count")
+                occ_lookup = {(r["_date"], r["_slot_num"]): r["count"]
+                              for _, r in occ.iterrows()}
+
+                # Build z matrix: rows=slots (bottom→top), cols=dates
+                z_grid  = []
+                txt_grid = []
+                for slot in all_slots:
+                    row_z   = []
+                    row_txt = []
+                    for d in all_dates:
+                        cnt = occ_lookup.get((d, slot), 0)
+                        row_z.append(cnt)
+                        row_txt.append(str(cnt) if cnt > 0 else "")
+                    z_grid.append(row_z)
+                    txt_grid.append(row_txt)
+
+                date_labels = [str(d) for d in all_dates]
+                cell_h = max(28, min(52, 400 // max(len(all_slots), 1)))
+                fig_sp = _go.Figure(data=_go.Heatmap(
+                    z=z_grid,
+                    x=date_labels,
+                    y=slot_labels,
+                    text=txt_grid,
+                    texttemplate="%{text}",
+                    textfont=dict(size=12, color="#111"),
+                    colorscale=[
+                        [0,    "#ffffff"],
+                        [0.01, "#dcfce7"],
+                        [0.4,  "#4ade80"],
+                        [1.0,  "#15803d"],
+                    ],
+                    zmin=0,
+                    showscale=False,
+                    hoverongaps=False,
+                    hovertemplate="<b>%{y}</b><br>%{x}<br>Occurrences: %{z}<extra></extra>",
+                ))
+                fig_sp.update_layout(
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    font_family="system-ui",
+                    height=max(300, len(all_slots) * cell_h + 120),
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    xaxis=dict(
+                        title="Date", tickangle=-45, tickfont=dict(size=11),
+                        side="bottom",
+                    ),
+                    yaxis=dict(
+                        title="Time Slot", tickfont=dict(size=11),
+                        autorange="reversed",
+                    ),
+                )
+                st.plotly_chart(fig_sp, use_container_width=True, config=_PLOTLY_CONFIG)
+
+                # Summary: which slot has most occurrences
+                slot_totals = occ.groupby("_slot_num")["count"].sum()
+                if len(slot_totals):
+                    peak_slot_num = slot_totals.idxmax()
+                    peak_label = slot_info.loc[
+                        slot_info["_slot_num"] == peak_slot_num, "_slot_label"
+                    ].values[0]
+                    peak_n = int(slot_totals.max())
+                    pct_slots_active = (z_grid != [[0]*len(all_dates)]*len(all_slots)) and len(all_slots) > 0
+                    concentrated = slot_totals.max() / slot_totals.sum() > 0.5
+                    st.markdown(
+                        f'<div style="font-size:12px;color:#374151;background:#f9fafb;'
+                        f'border-radius:6px;padding:10px 14px;margin-top:4px;">'
+                        f'<b>{sel_beh_sp}</b> occurs most frequently during '
+                        f'<b>{peak_label}</b> ({peak_n} instance{"s" if peak_n != 1 else ""}). '
+                        + ('<b>Pattern is concentrated</b> — over 50% of occurrences fall in one time slot, '
+                           'suggesting a strong time-based predictor.' if concentrated else
+                           'Occurrences are distributed across multiple time slots.')
+                        + '</div>',
+                        unsafe_allow_html=True
+                    )
+                st.markdown(
+                    '<div style="font-size:11px;color:#9ca3af;margin-top:6px;">'
+                    'Based on Touchette, MacDonald &amp; Langer (1985). '
+                    'Numbers inside cells show occurrence count per slot. '
+                    'Empty cells = no occurrence recorded.</div>',
+                    unsafe_allow_html=True
+                )
+
 
 # ── Tab: Interval Recording ───────────────────────────────────────────────────
 def tab_interval(all_entries, student_name, observer_name):
@@ -3361,6 +4961,7 @@ def tab_interval(all_entries, student_name, observer_name):
                     "date": str(date.today()),
                     "time": str(datetime.now().time()),
                     "student_name": student_name,
+                    "student_id": roster_id_for_name(student_name),
                     "observer_name": observer_name,
                     "observation_duration_minutes": round(iv_len * total / 60, 2),
                     "behavior": SS.iv_behavior,
@@ -3396,13 +4997,716 @@ def tab_interval(all_entries, student_name, observer_name):
 
 
 
+# ── Indirect Assessment Tab ───────────────────────────────────────────────────
+INDIRECT_FILE = os.path.join(DATA_DIR, "indirect_assessments.json")
+
+def load_indirect() -> dict:
+    return _safe_load(INDIRECT_FILE, {})
+
+def save_indirect(data: dict):
+    _safe_save(INDIRECT_FILE, data)
+
+# ── Instrument definitions ────────────────────────────────────────────────────
+_QFAB_ITEMS = [
+    # (key, question, response_type)  response_type: "text" | "likert5" | "yesno" | "multi"
+    ("qfab_informant",    "Informant name and role", "text"),
+    ("qfab_date",         "Date of interview", "text"),
+    ("qfab_beh_desc",     "Describe the behavior(s) of concern in observable terms", "text"),
+    ("qfab_settings",     "In which settings / times does the behavior most often occur?", "text"),
+    ("qfab_settings_not", "In which settings / times does the behavior rarely or never occur?", "text"),
+    ("qfab_antecedent",   "What typically happens right before the behavior?", "text"),
+    ("qfab_consequence",  "What typically happens right after the behavior?", "text"),
+    ("qfab_function_att", "Does the behavior seem to get adult or peer attention?",           "likert5"),
+    ("qfab_function_esc", "Does the behavior seem to help the student avoid tasks or demands?","likert5"),
+    ("qfab_function_tan", "Does the behavior seem to get access to items or activities?",     "likert5"),
+    ("qfab_function_sel", "Does the behavior seem to occur even when alone (sensory/automatic)?","likert5"),
+    ("qfab_history",      "How long has this behavior been a concern?", "text"),
+    ("qfab_prior_int",    "What interventions have been tried? Were they effective?", "text"),
+    ("qfab_summary",      "Additional comments or hypotheses from informant", "text"),
+]
+
+_FACTS_ITEMS = [
+    ("facts_informant",   "Informant name and role", "text"),
+    ("facts_date",        "Date", "text"),
+    ("facts_beh_topog",   "Describe the behavior (topography — what does it look like physically?)", "text"),
+    ("facts_beh_freq",    "How often does the behavior occur? (times per day / week)", "text"),
+    ("facts_beh_dur",     "How long does each episode typically last?", "text"),
+    ("facts_beh_intense", "How intense / disruptive is the behavior?", "likert5"),
+    ("facts_time_am",     "Morning (before 10 am): behavior likelihood",   "likert5"),
+    ("facts_time_mid",    "Mid-morning (10 am–noon): behavior likelihood", "likert5"),
+    ("facts_time_lunch",  "Lunch / transition: behavior likelihood",       "likert5"),
+    ("facts_time_pm",     "Afternoon: behavior likelihood",                "likert5"),
+    ("facts_time_late",   "Late day / end of school: behavior likelihood", "likert5"),
+    ("facts_setting_ind", "Independent work: behavior likelihood",  "likert5"),
+    ("facts_setting_grp", "Group instruction: behavior likelihood", "likert5"),
+    ("facts_setting_un",  "Unstructured time: behavior likelihood", "likert5"),
+    ("facts_setting_trn", "Transitions: behavior likelihood",       "likert5"),
+    ("facts_ant_demand",  "Antecedent — Difficult task / demand presented",        "likert5"),
+    ("facts_ant_correct", "Antecedent — Correction / redirection given",           "likert5"),
+    ("facts_ant_peer",    "Antecedent — Peer interaction / conflict",              "likert5"),
+    ("facts_ant_att_div", "Antecedent — Adult attention diverted",                 "likert5"),
+    ("facts_ant_denied",  "Antecedent — Preferred item/activity denied or removed","likert5"),
+    ("facts_con_att",     "Consequence — Adult attention provided",      "likert5"),
+    ("facts_con_remove",  "Consequence — Task/demand removed or reduced","likert5"),
+    ("facts_con_peer",    "Consequence — Peer attention",               "likert5"),
+    ("facts_con_item",    "Consequence — Access to item/activity",      "likert5"),
+    ("facts_con_none",    "Consequence — No observable change",         "likert5"),
+    ("facts_function",    "What is your best guess about the primary function of this behavior?", "text"),
+    ("facts_summary",     "Additional notes", "text"),
+]
+
+_FAI_ITEMS = [
+    ("fai_informant",      "Informant name and role", "text"),
+    ("fai_date",           "Date", "text"),
+    ("fai_describe",       "Describe the target behavior(s) in observable, measurable terms", "text"),
+    ("fai_exceptions",     "Are there times when the behavior never occurs? Describe.", "text"),
+    ("fai_med_rx",         "Is the student on any medications that may affect behavior?", "text"),
+    ("fai_medical",        "Any medical or physical conditions relevant to behavior?", "text"),
+    ("fai_sleep",          "Typical sleep pattern — hours per night, any disruptions?", "text"),
+    ("fai_diet",           "Any dietary concerns that may affect behavior?", "text"),
+    ("fai_comm_level",     "Student's primary communication mode and approximate level", "text"),
+    ("fai_reinf_social",   "Effectiveness of social praise as reinforcer",    "likert5"),
+    ("fai_reinf_tangible", "Effectiveness of tangible items as reinforcers",  "likert5"),
+    ("fai_reinf_activity", "Effectiveness of preferred activities as reinforcers", "likert5"),
+    ("fai_reinf_sensory",  "Effectiveness of sensory input as reinforcer",    "likert5"),
+    ("fai_reinf_escape",   "Does the student work to avoid / escape tasks?",  "likert5"),
+    ("fai_reinf_items",    "List specific reinforcers observed to be effective", "text"),
+    ("fai_antecedents",    "List the most common antecedents you observe", "text"),
+    ("fai_consequences",   "List the most common consequences that follow the behavior", "text"),
+    ("fai_function_att",   "Function: Attention-maintained likelihood",  "likert5"),
+    ("fai_function_esc",   "Function: Escape-maintained likelihood",     "likert5"),
+    ("fai_function_tan",   "Function: Tangible-maintained likelihood",   "likert5"),
+    ("fai_function_auto",  "Function: Automatic/sensory likelihood",     "likert5"),
+    ("fai_hypothesis",     "State your functional hypothesis in a summary sentence", "text"),
+    ("fai_notes",          "Additional observations", "text"),
+]
+
+_FAST_ITEMS = [
+    ("fast_informant",  "Informant name and role", "text"),
+    ("fast_date",       "Date", "text"),
+    # Attention subscale
+    ("fast_1",  "The behavior occurs when you stop attending to this person",           "likert5"),
+    ("fast_2",  "The behavior occurs when you are attending to someone else",           "likert5"),
+    ("fast_3",  "The behavior stops when you provide attention",                        "likert5"),
+    ("fast_4",  "The behavior occurs to get you to do something with the person",       "likert5"),
+    # Escape subscale
+    ("fast_5",  "The behavior occurs when the person is asked to do something",         "likert5"),
+    ("fast_6",  "The behavior occurs during difficult tasks",                           "likert5"),
+    ("fast_7",  "The behavior stops when demands are removed",                          "likert5"),
+    ("fast_8",  "The behavior occurs to avoid or delay activities",                     "likert5"),
+    # Tangible subscale
+    ("fast_9",  "The behavior occurs when preferred items are taken away",              "likert5"),
+    ("fast_10", "The behavior occurs when the person cannot access preferred items",    "likert5"),
+    ("fast_11", "The behavior stops when preferred items are given",                    "likert5"),
+    ("fast_12", "The behavior occurs to get items or activities",                       "likert5"),
+    # Sensory/Automatic subscale
+    ("fast_13", "The behavior occurs even when no one is watching",                     "likert5"),
+    ("fast_14", "The behavior occurs even when the person has everything they want",    "likert5"),
+    ("fast_15", "The behavior seems to be self-stimulatory (sensory input)",            "likert5"),
+    ("fast_16", "The behavior occurs regardless of what is happening in the environment","likert5"),
+    ("fast_notes", "Additional comments", "text"),
+]
+
+_MAS_ITEMS = [
+    ("mas_informant",  "Informant name and role", "text"),
+    ("mas_date",       "Date", "text"),
+    # Sensory subscale (items 1–4 in original MAS)
+    ("mas_1",  "Would the behavior occur continuously if no one was around?",                          "likert6"),
+    ("mas_2",  "Does the behavior occur when the person is left alone?",                              "likert6"),
+    ("mas_3",  "Does the behavior occur even though no one is watching?",                             "likert6"),
+    ("mas_4",  "Does the behavior seem to be self-reinforcing (provides its own reward)?",            "likert6"),
+    # Escape subscale (items 5–8)
+    ("mas_5",  "Does the behavior occur when a request is made of the person?",                       "likert6"),
+    ("mas_6",  "Does the behavior seem to occur when the person wants to avoid a task?",              "likert6"),
+    ("mas_7",  "Does the behavior occur when the person is told they cannot do something?",           "likert6"),
+    ("mas_8",  "Does the behavior seem to occur when an activity has become too difficult?",          "likert6"),
+    # Attention subscale (items 9–12)
+    ("mas_9",  "Does the behavior occur when you stop attending to the person?",                      "likert6"),
+    ("mas_10", "Does the behavior seem to be a way of getting your attention?",                       "likert6"),
+    ("mas_11", "Does the behavior occur when you are talking to someone else?",                       "likert6"),
+    ("mas_12", "Does the behavior occur when you are not paying attention to the person?",            "likert6"),
+    # Tangible subscale (items 13–16)
+    ("mas_13", "Does the behavior occur when preferred objects/activities are not available?",         "likert6"),
+    ("mas_14", "Does the behavior seem to be a way of getting a desired item or activity?",           "likert6"),
+    ("mas_15", "Does the behavior occur when you take away a preferred object/activity?",             "likert6"),
+    ("mas_16", "Does the behavior occur when preferred items are present but unavailable?",           "likert6"),
+    ("mas_notes", "Additional comments", "text"),
+]
+
+_LIKERT5_OPTS  = ["0 — Never", "1 — Rarely", "2 — Sometimes", "3 — Often", "4 — Always"]
+_LIKERT6_OPTS  = ["0 — Never", "1 — Almost never", "2 — Seldom", "3 — Half the time", "4 — Usually", "5 — Almost always", "6 — Always"]
+
+def _likert_score(val, max_val=4):
+    """Return numeric score from a likert option string."""
+    try:
+        return int(str(val).split("—")[0].strip())
+    except Exception:
+        return 0
+
+def _render_indirect_form(instrument_key, items, student, saved_data):
+    """Render a form for one indirect assessment instrument. Returns saved dict on submit."""
+    prefix = f"ia_{instrument_key}_{student}_"
+    with st.form(f"ia_form_{instrument_key}_{student}"):
+        responses = {}
+        for key, question, rtype in items:
+            st.markdown(
+                f'<div style="font-size:13px;font-weight:600;color:#111;margin-top:10px;">'
+                f'{question}</div>',
+                unsafe_allow_html=True
+            )
+            saved_val = saved_data.get(key, "")
+            if rtype == "text":
+                responses[key] = st.text_area(
+                    question, value=str(saved_val) if saved_val else "",
+                    label_visibility="collapsed", key=prefix + key, height=68
+                )
+            elif rtype == "likert5":
+                cur_val = saved_val if saved_val in _LIKERT5_OPTS else _LIKERT5_OPTS[0]
+                responses[key] = st.select_slider(
+                    question, options=_LIKERT5_OPTS, value=cur_val,
+                    label_visibility="collapsed", key=prefix + key
+                )
+            elif rtype == "likert6":
+                cur_val = saved_val if saved_val in _LIKERT6_OPTS else _LIKERT6_OPTS[0]
+                responses[key] = st.select_slider(
+                    question, options=_LIKERT6_OPTS, value=cur_val,
+                    label_visibility="collapsed", key=prefix + key
+                )
+        submitted = st.form_submit_button("💾  Save Responses", type="primary")
+    if submitted:
+        return responses
+    return None
+
+
+def _mas_subscale_scores(resp):
+    keys = [
+        ("Sensory / Automatic", ["mas_1","mas_2","mas_3","mas_4"]),
+        ("Escape",              ["mas_5","mas_6","mas_7","mas_8"]),
+        ("Attention",           ["mas_9","mas_10","mas_11","mas_12"]),
+        ("Tangible",            ["mas_13","mas_14","mas_15","mas_16"]),
+    ]
+    scores = {}
+    for label, ks in keys:
+        scores[label] = sum(_likert_score(resp.get(k, ""), max_val=6) for k in ks)
+    return scores
+
+def _fast_subscale_scores(resp):
+    keys = [
+        ("Attention", ["fast_1","fast_2","fast_3","fast_4"]),
+        ("Escape",    ["fast_5","fast_6","fast_7","fast_8"]),
+        ("Tangible",  ["fast_9","fast_10","fast_11","fast_12"]),
+        ("Sensory / Automatic", ["fast_13","fast_14","fast_15","fast_16"]),
+    ]
+    scores = {}
+    for label, ks in keys:
+        scores[label] = sum(_likert_score(resp.get(k, ""), max_val=4) for k in ks)
+    return scores
+
+def _fai_function_scores(resp):
+    return {
+        "Attention":           _likert_score(resp.get("fai_function_att", ""), 4),
+        "Escape":              _likert_score(resp.get("fai_function_esc", ""), 4),
+        "Tangible":            _likert_score(resp.get("fai_function_tan", ""), 4),
+        "Sensory / Automatic": _likert_score(resp.get("fai_function_auto",""), 4),
+    }
+
+def _qfab_function_scores(resp):
+    return {
+        "Attention":           _likert_score(resp.get("qfab_function_att", ""), 4),
+        "Escape":              _likert_score(resp.get("qfab_function_esc", ""), 4),
+        "Tangible":            _likert_score(resp.get("qfab_function_tan", ""), 4),
+        "Sensory / Automatic": _likert_score(resp.get("qfab_function_sel", ""), 4),
+    }
+
+def _render_function_bar(scores, title="Function Profile"):
+    if not any(scores.values()):
+        return
+    labels = list(scores.keys())
+    vals   = list(scores.values())
+    colors = ["#6366f1", "#f59e0b", "#10b981", "#ef4444"]
+    fig = _go.Figure(_go.Bar(
+        x=labels, y=vals,
+        marker_color=colors[:len(labels)],
+        text=vals, textposition="outside",
+    ))
+    fig.update_layout(
+        title=title,
+        plot_bgcolor="white", paper_bgcolor="white",
+        font_family="system-ui",
+        height=260,
+        margin=dict(l=0, r=0, t=40, b=0),
+        yaxis=dict(title="Score", tickformat="d"),
+        xaxis=dict(title=""),
+    )
+    st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CONFIG)
+
+
+def tab_indirect_assessment(student: str):
+    ia_all  = load_indirect()
+    ia_data = ia_all.get(student, {})
+
+    # ── Session state for selected instrument ─────────────────────────────────
+    nav_key = f"ia_nav_{student}"
+    if nav_key not in st.session_state:
+        st.session_state[nav_key] = "QFAB"
+
+    _INSTRUMENTS = [
+        ("QFAB",        "qfab",       "📝"),
+        ("FACTS",       "facts",      "📋"),
+        ("FAI",         "fai",        "📄"),
+        ("FAST",        "fast",       "⚡"),
+        ("MAS",         "mas",        "📊"),
+        ("Results",     None,         "📊"),
+    ]
+
+    nav_col, content_col = st.columns([1, 3], gap="medium")
+
+    with nav_col:
+        for name, data_key, icon in _INSTRUMENTS:
+            is_active   = st.session_state[nav_key] == name
+            is_complete = bool(data_key and ia_data.get(data_key))
+            label = f"✓ {name}" if is_complete else name
+            btn_type = "primary" if is_active else "secondary"
+            if st.button(label, key=f"ia_nav_btn_{student}_{name}",
+                         use_container_width=True, type=btn_type):
+                st.session_state[nav_key] = name
+                st.rerun()
+
+    selected = st.session_state[nav_key]
+
+    with content_col:
+
+        # ── Results ──────────────────────────────────────────────────────────
+        if selected == "Results":
+            saved_qfab  = ia_data.get("qfab",  {})
+            saved_facts = ia_data.get("facts", {})
+            saved_fai   = ia_data.get("fai",   {})
+            saved_fast  = ia_data.get("fast",  {})
+            saved_mas   = ia_data.get("mas",   {})
+
+            functions = ["Attention", "Escape", "Tangible", "Sensory / Automatic"]
+            completed = {}
+            if saved_qfab:  completed["QFAB"]  = _qfab_function_scores(saved_qfab)
+            if saved_fai:   completed["FAI"]   = _fai_function_scores(saved_fai)
+            if saved_fast:  completed["FAST"]  = _fast_subscale_scores(saved_fast)
+            if saved_mas:   completed["MAS"]   = _mas_subscale_scores(saved_mas)
+
+            if not completed and not saved_facts:
+                st.info("No instruments completed yet. Select an instrument from the left panel and save responses to see results here.")
+            else:
+                # ── Cross-instrument comparison table ─────────────────────────
+                if completed:
+                    st.markdown(
+                        '<div style="font-weight:700;font-size:15px;color:#111;margin-bottom:10px;">'
+                        'Cross-Instrument Function Summary</div>',
+                        unsafe_allow_html=True
+                    )
+                    table_rows = []
+                    for inst, scores in completed.items():
+                        total = sum(scores.values()) or 1
+                        row = {"Instrument": inst}
+                        for fn in functions:
+                            row[fn] = f"{scores.get(fn, 0) / total * 100:.0f}%"
+                        row["Top Function"] = max(scores, key=scores.get)
+                        table_rows.append(row)
+                    st.dataframe(
+                        pd.DataFrame(table_rows).set_index("Instrument"),
+                        use_container_width=True
+                    )
+                    st.markdown(
+                        '<div style="font-weight:700;font-size:15px;color:#111;'
+                        'margin-top:18px;margin-bottom:6px;">Function Profile by Instrument</div>',
+                        unsafe_allow_html=True
+                    )
+                    colors = {"Attention": "#6366f1", "Escape": "#f59e0b",
+                              "Tangible": "#10b981", "Sensory / Automatic": "#ef4444"}
+                    fig_cross = _go.Figure()
+                    for fn in functions:
+                        fig_cross.add_trace(_go.Bar(
+                            name=fn,
+                            x=list(completed.keys()),
+                            y=[completed[inst].get(fn, 0) for inst in completed],
+                            marker_color=colors[fn],
+                        ))
+                    fig_cross.update_layout(
+                        barmode="group",
+                        plot_bgcolor="white", paper_bgcolor="white",
+                        font_family="system-ui", height=300,
+                        margin=dict(l=0, r=0, t=10, b=0),
+                        yaxis=dict(title="Score", tickformat="d"),
+                        xaxis=dict(title=""),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig_cross, use_container_width=True, config=_PLOTLY_CONFIG)
+                    top_counts = {fn: 0 for fn in functions}
+                    for scores in completed.values():
+                        top_counts[max(scores, key=scores.get)] += 1
+                    consensus_fn = max(top_counts, key=top_counts.get)
+                    n_agree = top_counts[consensus_fn]
+                    n_total = len(completed)
+                    st.markdown(
+                        f'<div style="background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px;'
+                        f'padding:14px 18px;margin-top:4px;">'
+                        f'<b>{n_agree} of {n_total} instrument{"s" if n_total > 1 else ""} '
+                        f'point to <span style="color:#16a34a;">{consensus_fn}</span> '
+                        f'as the primary function.</b>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
+                # ── FACTS charts ──────────────────────────────────────────────
+                if saved_facts:
+                    st.markdown(
+                        '<div style="font-weight:700;font-size:15px;color:#111;'
+                        'margin-top:22px;margin-bottom:6px;">FACTS — Time of Day Likelihood</div>',
+                        unsafe_allow_html=True
+                    )
+                    time_keys = [
+                        ("facts_time_am",   "Morning"),
+                        ("facts_time_mid",  "Mid-morning"),
+                        ("facts_time_lunch","Lunch"),
+                        ("facts_time_pm",   "Afternoon"),
+                        ("facts_time_late", "Late day"),
+                    ]
+                    t_labels = [l for _, l in time_keys]
+                    t_vals   = [_likert_score(saved_facts.get(k, "")) for k, _ in time_keys]
+                    fig_t = _go.Figure(_go.Bar(x=t_labels, y=t_vals, marker_color="#6366f1",
+                                               text=t_vals, textposition="outside"))
+                    fig_t.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                        font_family="system-ui", height=220,
+                                        margin=dict(l=0,r=0,t=10,b=0),
+                                        yaxis=dict(title="Rating (0–4)", tickformat="d", range=[0,5]))
+                    st.plotly_chart(fig_t, use_container_width=True, config=_PLOTLY_CONFIG)
+
+                    st.markdown(
+                        '<div style="font-weight:700;font-size:15px;color:#111;'
+                        'margin-top:14px;margin-bottom:6px;">FACTS — Setting Likelihood</div>',
+                        unsafe_allow_html=True
+                    )
+                    setting_keys = [
+                        ("facts_setting_ind", "Independent"),
+                        ("facts_setting_grp", "Group"),
+                        ("facts_setting_un",  "Unstructured"),
+                        ("facts_setting_trn", "Transitions"),
+                    ]
+                    s_labels = [l for _, l in setting_keys]
+                    s_vals   = [_likert_score(saved_facts.get(k, "")) for k, _ in setting_keys]
+                    fig_s = _go.Figure(_go.Bar(x=s_labels, y=s_vals, marker_color="#10b981",
+                                               text=s_vals, textposition="outside"))
+                    fig_s.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                        font_family="system-ui", height=220,
+                                        margin=dict(l=0,r=0,t=10,b=0),
+                                        yaxis=dict(title="Rating (0–4)", tickformat="d", range=[0,5]))
+                    st.plotly_chart(fig_s, use_container_width=True, config=_PLOTLY_CONFIG)
+
+                    st.markdown(
+                        '<div style="font-weight:700;font-size:15px;color:#111;'
+                        'margin-top:14px;margin-bottom:6px;">FACTS — Antecedent Ratings</div>',
+                        unsafe_allow_html=True
+                    )
+                    ant_keys = [
+                        ("facts_ant_demand",  "Difficult task"),
+                        ("facts_ant_correct", "Correction"),
+                        ("facts_ant_peer",    "Peer conflict"),
+                        ("facts_ant_att_div", "Attn. diverted"),
+                        ("facts_ant_denied",  "Item denied"),
+                    ]
+                    a_labels = [l for _, l in ant_keys]
+                    a_vals   = [_likert_score(saved_facts.get(k, "")) for k, _ in ant_keys]
+                    fig_a = _go.Figure(_go.Bar(x=a_labels, y=a_vals, marker_color="#f59e0b",
+                                               text=a_vals, textposition="outside"))
+                    fig_a.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                        font_family="system-ui", height=220,
+                                        margin=dict(l=0,r=0,t=10,b=0),
+                                        yaxis=dict(title="Rating (0–4)", tickformat="d", range=[0,5]))
+                    st.plotly_chart(fig_a, use_container_width=True, config=_PLOTLY_CONFIG)
+
+                # ── FAI informant hypothesis ──────────────────────────────────
+                if saved_fai:
+                    hyp = saved_fai.get("fai_hypothesis", "").strip()
+                    if hyp:
+                        st.markdown(
+                            f'<div style="background:#f0fdf4;border:1.5px solid #bbf7d0;'
+                            f'border-radius:10px;padding:14px 18px;margin-top:16px;">'
+                            f'<div style="font-size:11px;font-weight:700;color:#16a34a;margin-bottom:4px;">'
+                            f'FAI — INFORMANT HYPOTHESIS</div>'
+                            f'<div style="font-size:13px;color:#111;">{hyp}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+        # ── QFAB ─────────────────────────────────────────────────────────────
+        elif selected == "QFAB":
+            st.markdown(
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
+                '<b>Questionnaire for Functional Behavioral Assessment (QFAB)</b> — '
+                'A flexible open-format interview covering behavior description, '
+                'antecedents, consequences, and informant-rated function hypotheses. '
+                'Suitable for teacher or parent informants.</div>',
+                unsafe_allow_html=True
+            )
+            saved_qfab = ia_data.get("qfab", {})
+            result = _render_indirect_form("qfab", _QFAB_ITEMS, student, saved_qfab)
+            if result is not None:
+                ia_data["qfab"] = result
+                ia_all[student] = ia_data
+                save_indirect(ia_all)
+                audit_log("INDIRECT_SAVE", f"QFAB saved for '{student}'")
+                st.toast("QFAB saved.", icon="✅")
+
+        # ── FACTS ────────────────────────────────────────────────────────────
+        elif selected == "FACTS":
+            st.markdown(
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
+                '<b>Functional Assessment Checklist for Teachers and Staff (FACTS)</b> — '
+                'O\'Neill et al. Two-part interview: Part A identifies routines and settings; '
+                'Part B focuses the analysis on the highest-priority routine. '
+                'Rates antecedents, consequences, and perceived function.</div>',
+                unsafe_allow_html=True
+            )
+            saved_facts = ia_data.get("facts", {})
+            result = _render_indirect_form("facts", _FACTS_ITEMS, student, saved_facts)
+            if result is not None:
+                ia_data["facts"] = result
+                ia_all[student] = ia_data
+                save_indirect(ia_all)
+                audit_log("INDIRECT_SAVE", f"FACTS saved for '{student}'")
+                st.toast("FACTS saved.", icon="✅")
+
+        # ── FAI ──────────────────────────────────────────────────────────────
+        elif selected == "FAI":
+            st.markdown(
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
+                '<b>Functional Assessment Interview (FAI)</b> — O\'Neill et al. '
+                'Comprehensive structured interview covering behavior description, '
+                'ecological factors (medical, sleep, diet), communication profile, '
+                'reinforcer effectiveness, and functional hypothesis. '
+                'Typically completed with a teacher and parent.</div>',
+                unsafe_allow_html=True
+            )
+            saved_fai = ia_data.get("fai", {})
+            result = _render_indirect_form("fai", _FAI_ITEMS, student, saved_fai)
+            if result is not None:
+                ia_data["fai"] = result
+                ia_all[student] = ia_data
+                save_indirect(ia_all)
+                audit_log("INDIRECT_SAVE", f"FAI saved for '{student}'")
+                st.toast("FAI saved.", icon="✅")
+
+        # ── FAST ─────────────────────────────────────────────────────────────
+        elif selected == "FAST":
+            st.markdown(
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
+                '<b>Functional Analysis Screening Tool (FAST)</b> — Iwata & DeLeon. '
+                '16-item rating scale organized into four subscales: '
+                'Attention, Escape, Tangible, and Sensory/Automatic. '
+                'Highest subscale score indicates the most likely behavioral function. '
+                'Quick to administer (5–10 minutes).</div>',
+                unsafe_allow_html=True
+            )
+            saved_fast = ia_data.get("fast", {})
+            result = _render_indirect_form("fast", _FAST_ITEMS, student, saved_fast)
+            if result is not None:
+                ia_data["fast"] = result
+                ia_all[student] = ia_data
+                save_indirect(ia_all)
+                audit_log("INDIRECT_SAVE", f"FAST saved for '{student}'")
+                st.toast("FAST saved.", icon="✅")
+
+        # ── MAS ──────────────────────────────────────────────────────────────
+        elif selected == "MAS":
+            st.markdown(
+                '<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">'
+                '<b>Motivation Assessment Scale (MAS)</b> — Durand & Crimmins (1988). '
+                '16-item rating scale with four subscales: Sensory, Escape, Attention, Tangible. '
+                'Each subscale scored 0–24. Widely used in clinical and school settings. '
+                'Complete one MAS per behavior of concern.</div>',
+                unsafe_allow_html=True
+            )
+            saved_mas = ia_data.get("mas", {})
+            result = _render_indirect_form("mas", _MAS_ITEMS, student, saved_mas)
+            if result is not None:
+                ia_data["mas"] = result
+                ia_all[student] = ia_data
+                save_indirect(ia_all)
+                audit_log("INDIRECT_SAVE", f"MAS saved for '{student}'")
+                st.toast("MAS saved.", icon="✅")
+
+        # ── Reinforcer Assessment ─────────────────────────────────────────────
+
+
+# ── Reinforcer Assessment Tab ─────────────────────────────────────────────────
+_REINF_RATING = ["0 — Not effective", "1 — Mildly effective",
+                 "2 — Moderately effective", "3 — Highly effective", "4 — Most preferred"]
+_POS_REINFORCERS = [
+    ("pr_verbal_praise",    "Verbal praise / specific praise",              "Social"),
+    ("pr_attention",        "One-on-one adult attention",                    "Social"),
+    ("pr_peer_interaction", "Peer interaction / social time",                "Social"),
+    ("pr_high_five",        "Physical acknowledgment (high-five, fist bump)","Social"),
+    ("pr_stickers",         "Stickers / stamps / tokens",                    "Tangible"),
+    ("pr_food_snack",       "Preferred food or snack",                       "Tangible"),
+    ("pr_fidget",           "Fidget or sensory toy",                         "Tangible"),
+    ("pr_prize_box",        "Prize box / treasure chest item",               "Tangible"),
+    ("pr_screen_time",      "Screen time / tablet / computer",               "Activity"),
+    ("pr_free_choice",      "Free choice / preferred activity time",         "Activity"),
+    ("pr_game",             "Game (board game, card game, video game)",      "Activity"),
+    ("pr_movement",         "Movement break / physical activity",            "Activity"),
+    ("pr_music",            "Music / listening to preferred songs",          "Sensory"),
+    ("pr_sensory_input",    "Preferred sensory input (squeeze, spin, etc.)", "Sensory"),
+    ("pr_quiet_space",      "Access to quiet space",                         "Sensory"),
+    ("pr_helper_role",      "Helper / leadership role in class",             "Other"),
+    ("pr_homework_pass",    "Homework pass / reduced work",                  "Other"),
+    ("pr_extra_recess",     "Extra recess or outdoor time",                  "Other"),
+]
+_NEG_REINFORCERS = [
+    ("nr_demand_removal",   "Task or demand removed / reduced",               "Escape — Task"),
+    ("nr_task_shortened",   "Task shortened or broken into smaller steps",    "Escape — Task"),
+    ("nr_diff_reduced",     "Difficulty of task reduced",                     "Escape — Task"),
+    ("nr_peer_removed",     "Removed from group or peer proximity",           "Escape — Social"),
+    ("nr_adult_backs_off",  "Adult withdraws / stops giving attention",       "Escape — Social"),
+    ("nr_alone_time",       "Access to time alone / isolation preferred",     "Escape — Social"),
+    ("nr_avoid_transition", "Transition delayed or avoided",                  "Escape — Transition"),
+    ("nr_avoid_noise",      "Removed from noisy / crowded environment",       "Escape — Sensory"),
+    ("nr_avoid_bright",     "Removed from bright lights / visual stimulation","Escape — Sensory"),
+    ("nr_avoid_touch",      "Avoids unexpected touch or physical proximity",  "Escape — Sensory"),
+]
+
+def tab_reinforcers(student: str):
+    ia_all  = load_indirect()
+    ia_data = ia_all.get(student, {})
+    saved_reinf = ia_data.get("reinforcers", {})
+
+    pr_col, nr_col = st.columns(2)
+
+    # ── Positive ─────────────────────────────────────────────────────────────
+    with pr_col:
+        st.markdown(
+            '<div style="font-weight:700;font-size:14px;color:#6366f1;margin-bottom:8px;">'
+            'Positive Reinforcers</div>',
+            unsafe_allow_html=True
+        )
+        with st.form(f"reinf_form_pos_{student}"):
+            pr_responses = {}
+            categories = list(dict.fromkeys(c for _, _, c in _POS_REINFORCERS))
+            for cat in categories:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:#6366f1;'
+                    f'text-transform:uppercase;letter-spacing:.05em;margin-top:12px;">'
+                    f'{cat}</div>',
+                    unsafe_allow_html=True
+                )
+                for key, label, c in _POS_REINFORCERS:
+                    if c != cat:
+                        continue
+                    saved_val = saved_reinf.get(key, _REINF_RATING[0])
+                    cur_val = saved_val if saved_val in _REINF_RATING else _REINF_RATING[0]
+                    st.markdown(
+                        f'<div style="font-size:12px;font-weight:600;color:#111;margin-top:6px;">'
+                        f'{label}</div>', unsafe_allow_html=True
+                    )
+                    pr_responses[key] = st.select_slider(
+                        label, options=_REINF_RATING, value=cur_val,
+                        label_visibility="collapsed", key=f"reinf_pr_{student}_{key}"
+                    )
+            pr_notes = st.text_area(
+                "Notes", value=saved_reinf.get("pr_notes", ""),
+                key=f"reinf_pr_notes_{student}", height=60
+            )
+            pr_submitted = st.form_submit_button("💾  Save", type="primary", use_container_width=True)
+        if pr_submitted:
+            updated = {**saved_reinf, **pr_responses, "pr_notes": pr_notes}
+            ia_data["reinforcers"] = updated
+            ia_all[student] = ia_data
+            save_indirect(ia_all)
+            audit_log("INDIRECT_SAVE", f"Positive reinforcers saved for '{student}'")
+            st.toast("Positive reinforcers saved.", icon="✅")
+            saved_reinf = ia_data.get("reinforcers", {})
+        pr_scores = {label: _likert_score(saved_reinf.get(key, ""), 4)
+                     for key, label, _ in _POS_REINFORCERS}
+        top_pr = {k: v for k, v in pr_scores.items() if v > 0}
+        if top_pr:
+            top_sorted = dict(sorted(top_pr.items(), key=lambda x: x[1], reverse=True)[:8])
+            fig_pr = _go.Figure(_go.Bar(
+                x=list(top_sorted.values()), y=list(top_sorted.keys()),
+                orientation="h", marker_color="#6366f1",
+                text=list(top_sorted.values()), textposition="outside",
+            ))
+            fig_pr.update_layout(
+                title="Top Positive Reinforcers",
+                plot_bgcolor="white", paper_bgcolor="white", font_family="system-ui",
+                height=max(200, len(top_sorted) * 30 + 60),
+                margin=dict(l=0, r=40, t=40, b=0),
+                xaxis=dict(tickformat="d", range=[0, 5]),
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fig_pr, use_container_width=True, config=_PLOTLY_CONFIG)
+
+    # ── Negative ─────────────────────────────────────────────────────────────
+    with nr_col:
+        st.markdown(
+            '<div style="font-weight:700;font-size:14px;color:#ef4444;margin-bottom:8px;">'
+            'Negative Reinforcers</div>',
+            unsafe_allow_html=True
+        )
+        with st.form(f"reinf_form_neg_{student}"):
+            nr_responses = {}
+            nr_categories = list(dict.fromkeys(c for _, _, c in _NEG_REINFORCERS))
+            for cat in nr_categories:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:#ef4444;'
+                    f'text-transform:uppercase;letter-spacing:.05em;margin-top:12px;">'
+                    f'{cat}</div>',
+                    unsafe_allow_html=True
+                )
+                for key, label, c in _NEG_REINFORCERS:
+                    if c != cat:
+                        continue
+                    saved_val = saved_reinf.get(key, _REINF_RATING[0])
+                    cur_val = saved_val if saved_val in _REINF_RATING else _REINF_RATING[0]
+                    st.markdown(
+                        f'<div style="font-size:12px;font-weight:600;color:#111;margin-top:6px;">'
+                        f'{label}</div>', unsafe_allow_html=True
+                    )
+                    nr_responses[key] = st.select_slider(
+                        label, options=_REINF_RATING, value=cur_val,
+                        label_visibility="collapsed", key=f"reinf_nr_{student}_{key}"
+                    )
+            nr_notes = st.text_area(
+                "Notes", value=saved_reinf.get("nr_notes", ""),
+                key=f"reinf_nr_notes_{student}", height=60
+            )
+            nr_submitted = st.form_submit_button("💾  Save", type="primary", use_container_width=True)
+        if nr_submitted:
+            updated = {**saved_reinf, **nr_responses, "nr_notes": nr_notes}
+            ia_data["reinforcers"] = updated
+            ia_all[student] = ia_data
+            save_indirect(ia_all)
+            audit_log("INDIRECT_SAVE", f"Negative reinforcers saved for '{student}'")
+            st.toast("Negative reinforcers saved.", icon="✅")
+            saved_reinf = ia_data.get("reinforcers", {})
+        nr_scores = {label: _likert_score(saved_reinf.get(key, ""), 4)
+                     for key, label, _ in _NEG_REINFORCERS}
+        top_nr = {k: v for k, v in nr_scores.items() if v > 0}
+        if top_nr:
+            top_sorted = dict(sorted(top_nr.items(), key=lambda x: x[1], reverse=True))
+            fig_nr = _go.Figure(_go.Bar(
+                x=list(top_sorted.values()), y=list(top_sorted.keys()),
+                orientation="h", marker_color="#ef4444",
+                text=list(top_sorted.values()), textposition="outside",
+            ))
+            fig_nr.update_layout(
+                title="Escape / Avoidance Profile",
+                plot_bgcolor="white", paper_bgcolor="white", font_family="system-ui",
+                height=max(200, len(top_sorted) * 30 + 60),
+                margin=dict(l=0, r=40, t=40, b=0),
+                xaxis=dict(tickformat="d", range=[0, 5]),
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fig_nr, use_container_width=True, config=_PLOTLY_CONFIG)
+
+
 # ── Category Settings Page ────────────────────────────────────────────────────
 def page_settings():
-    # Back button
-    if st.button("← Back"):
-        st.session_state["show_settings"] = False
-        st.rerun()
-
     st.markdown(
         '<div style="margin-bottom:4px;">'
         '<div style="font-size:22px;font-weight:800;color:#111;letter-spacing:.03em;">'
@@ -3415,8 +5719,8 @@ def page_settings():
     st.markdown("---")
 
     cats = load_categories()
-    tab_abc, tab_setting, tab_users, tab_audit = st.tabs(
-        ["A – B – C", "Setting Fields", "👤 Users", "🔒 Audit Log"]
+    tab_abc, tab_setting, tab_mo, tab_users, tab_audit = st.tabs(
+        ["A – B – C", "Setting Fields", "⚡ Motivating Operations", "👤 Users", "🔒 Audit Log"]
     )
 
     def category_editor(label, key, cats):
@@ -3513,6 +5817,109 @@ def page_settings():
         with c1:
             category_editor("Consequences", "consequences", cats)
 
+        # ── Operational Behavioral Definitions ───────────────────────────────
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown(
+            '<div style="font-size:17px;font-weight:700;color:#111;margin-bottom:4px;">'
+            'Operational Behavioral Definitions</div>'
+            '<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">'
+            'Write a clear, observable, and measurable definition for each behavior. '
+            'Definitions appear in the New ABC Entry form as a reference when recording data.</div>',
+            unsafe_allow_html=True
+        )
+        defs = cats.get("behavior_definitions", {})
+        def_checks = cats.get("behavior_def_checks", {})
+        behaviors = cats.get("behaviors", [])
+        if not behaviors:
+            st.info("No behaviors defined yet. Add behaviors above first.")
+
+        _CHECKLIST = [
+            ("topography",  "Describes observable, physical actions (topography) — what the body does"),
+            ("onset_offset","Includes when the behavior starts and stops (onset / offset)"),
+            ("threshold",   "Specifies an intensity or duration threshold if needed"),
+            ("exclusion",   "Includes at least one exclusion — what does NOT count"),
+            ("ioa",         "Tested with a second observer (IOA ≥ 80%)"),
+        ]
+
+        for beh in behaviors:
+            saved_def   = defs.get(beh, "")
+            saved_chks  = def_checks.get(beh, {})
+            all_checked = all(saved_chks.get(k, False) for k, _ in _CHECKLIST)
+            label = f"📋 {beh}  ✓" if (saved_def and all_checked) else f"📋 {beh}"
+            with st.expander(label, expanded=bool(saved_def) and not all_checked):
+                st.markdown(
+                    '<div style="font-size:12px;color:#6b7280;margin-bottom:8px;">'
+                    'Write the definition below, then use the checklist to confirm it meets '
+                    'quality criteria before saving.</div>',
+                    unsafe_allow_html=True
+                )
+                new_def = st.text_area(
+                    "Definition",
+                    value=saved_def,
+                    height=110,
+                    placeholder=(
+                        f"'{beh}' is defined as any instance of… "
+                        f"The behavior begins when… and ends when… "
+                        f"Does not include…"
+                    ),
+                    label_visibility="collapsed",
+                    key=f"def_{beh}"
+                )
+
+                st.markdown(
+                    '<div style="font-size:12px;font-weight:600;color:#374151;'
+                    'margin:10px 0 4px 0;">Quality Checklist</div>',
+                    unsafe_allow_html=True
+                )
+                new_chks = {}
+                for ck_key, ck_label in _CHECKLIST:
+                    new_chks[ck_key] = st.checkbox(
+                        ck_label,
+                        value=saved_chks.get(ck_key, False),
+                        key=f"chk_{beh}_{ck_key}"
+                    )
+
+                all_now = all(new_chks.values())
+                ready   = bool(new_def.strip()) and all_now
+
+                if not all_now and new_def.strip():
+                    remaining = sum(1 for k, _ in _CHECKLIST if not new_chks.get(k))
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#d97706;margin-top:4px;">'
+                        f'{remaining} checklist item{"s" if remaining != 1 else ""} remaining</div>',
+                        unsafe_allow_html=True
+                    )
+
+                dc1, dc2 = st.columns([1, 4])
+                with dc1:
+                    if st.button(
+                        "💾 Save",
+                        key=f"save_def_{beh}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not bool(new_def.strip()),
+                    ):
+                        defs[beh] = new_def.strip()
+                        cats["behavior_definitions"] = defs
+                        def_checks[beh] = new_chks
+                        cats["behavior_def_checks"] = def_checks
+                        save_categories(cats)
+                        st.success("Definition saved." if not all_now else "✓ Definition complete and verified.")
+                        st.rerun()
+                with dc2:
+                    if saved_def and all_checked:
+                        st.markdown(
+                            '<div style="font-size:12px;color:#16a34a;padding-top:8px;">'
+                            '✓ Definition complete and verified</div>',
+                            unsafe_allow_html=True
+                        )
+                    elif saved_def:
+                        st.markdown(
+                            '<div style="font-size:12px;color:#d97706;padding-top:8px;">'
+                            '⚠ Definition saved — checklist incomplete</div>',
+                            unsafe_allow_html=True
+                        )
+
     with tab_setting:
         c1, c2 = st.columns(2)
         with c1:
@@ -3529,6 +5936,87 @@ def page_settings():
         c1, _ = st.columns(2)
         with c1:
             category_editor("Instructional Formats", "instructional_formats", cats)
+
+    # ── Motivating Operations tab ─────────────────────────────────────────────
+    with tab_mo:
+        st.markdown(
+            '<div style="font-size:13px;color:#6b7280;margin-bottom:16px;">'
+            'The default MO list covers biological, social, environmental, and task conditions. '
+            'Add custom MOs below for conditions specific to your students or setting. '
+            'All items appear as checkboxes in the New ABC Entry form.</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── Default MO list (read-only display) ──────────────────────────────
+        st.markdown(
+            '<div style="font-size:15px;font-weight:700;color:#111;margin-bottom:10px;">'
+            'Default Motivating Operations</div>',
+            unsafe_allow_html=True
+        )
+        tier_colors = {1: ("#dcfce7", "#15803d", "Auto-detected"),
+                       2: ("#eff6ff", "#1d4ed8", "Observer checkbox"),
+                       3: ("#fef9c3", "#854d0e", "External / contextual")}
+        for domain, items in MO_DEFAULTS.items():
+            with st.expander(domain, expanded=False):
+                for mo in items:
+                    bg, fg, tier_label = tier_colors[mo["tier"]]
+                    st.markdown(
+                        f'<div style="display:flex;align-items:flex-start;gap:10px;'
+                        f'padding:8px 10px;border:1px solid #e5e7eb;border-radius:8px;'
+                        f'background:white;margin-bottom:6px;">'
+                        f'<span style="background:{bg};color:{fg};font-size:10px;font-weight:700;'
+                        f'padding:2px 7px;border-radius:10px;white-space:nowrap;margin-top:2px;">'
+                        f'Tier {mo["tier"]}</span>'
+                        f'<span style="font-size:13px;color:#374151;">{mo["label"]}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
+        # ── Custom MOs ────────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="font-size:15px;font-weight:700;color:#111;margin:20px 0 6px 0;">'
+            'Custom Motivating Operations</div>'
+            '<div style="font-size:12px;color:#6b7280;margin-bottom:12px;">'
+            'Add conditions specific to your students or setting.</div>',
+            unsafe_allow_html=True
+        )
+        custom_mos = cats.get("custom_mos", [])
+        if custom_mos:
+            for i, cmo in enumerate(custom_mos):
+                cm1, cm2 = st.columns([5, 1])
+                with cm1:
+                    st.markdown(
+                        f'<div style="padding:9px 12px;background:white;border:1px solid #e5e7eb;'
+                        f'border-radius:8px;font-size:13px;color:#374151;">{cmo}</div>',
+                        unsafe_allow_html=True
+                    )
+                with cm2:
+                    if st.button("✕", key=f"del_cmo_{i}", use_container_width=True):
+                        custom_mos.pop(i)
+                        cats["custom_mos"] = custom_mos
+                        save_categories(cats)
+                        st.rerun()
+        else:
+            st.markdown(
+                '<div style="font-size:12px;color:#9ca3af;padding:10px;">No custom MOs added yet.</div>',
+                unsafe_allow_html=True
+            )
+        cmo_c1, cmo_c2 = st.columns([5, 1])
+        with cmo_c1:
+            new_cmo = st.text_input(
+                "New custom MO", placeholder="Describe the observable condition...",
+                label_visibility="collapsed", key="new_cmo_input"
+            )
+        with cmo_c2:
+            if st.button("＋ Add", key="add_cmo_btn", type="primary", use_container_width=True):
+                v = new_cmo.strip()
+                if v and v not in custom_mos:
+                    custom_mos.append(v)
+                    cats["custom_mos"] = custom_mos
+                    save_categories(cats)
+                    st.rerun()
+                elif v in custom_mos:
+                    st.warning("Already exists.")
 
     # ── Users tab (admin only) ────────────────────────────────────────────────
     with tab_users:
@@ -3555,8 +6043,7 @@ def page_settings():
                 with uc3:
                     if uname != "admin" and st.button("✕", key=f"del_user_{uname}"):
                         del users[uname]
-                        with open(USERS_FILE, "w") as f:
-                            json.dump(users, f, indent=2)
+                        _safe_save(USERS_FILE, users)
                         audit_log("DELETE_USER", f"User {uname} deleted")
                         st.rerun()
 
@@ -3585,8 +6072,7 @@ def page_settings():
                                 "name": new_uname_display.strip() or new_uname,
                                 "role": "observer",
                             }
-                            with open(USERS_FILE, "w") as f:
-                                json.dump(users, f, indent=2)
+                            _safe_save(USERS_FILE, users)
                             audit_log("CREATE_USER", f"User {new_uname} created")
                             st.success(f"User '{new_uname}' added.")
                             st.rerun()
@@ -3618,12 +6104,24 @@ def page_settings():
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="FBA Data Tracker", page_icon="📋",
-                       layout="centered")
+                       layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+
+    # ── Data safety: surface any corrupt/recovered file from this session ──────
+    for _p, _msg in _LOAD_ERRORS.items():
+        _name = os.path.basename(_p)
+        if _p in _QUARANTINED:
+            st.error(f"⚠️ **{_name}** {_msg}")
+        else:
+            st.warning(f"♻️ **{_name}** {_msg}")
 
     for key, default in [("logged_in", False), ("selected_student", None),
                           ("observer_name", ""), ("confirm_del", False),
-                          ("last_active", None), ("user_role", "observer")]:
+                          ("last_active", None), ("user_role", "observer"),
+                          ("show_edit_student", False), ("confirm_clear", False),
+                          ("show_edit_selector", False), ("show_remove_selector", False),
+                          ("show_archive_selector", False), ("confirm_archive", False),
+                          ("show_register", False)]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -3643,6 +6141,11 @@ def main():
         return
 
     if st.session_state.get("show_settings"):
+        with st.form("settings_back_form", border=False):
+            submitted = st.form_submit_button("← Back to Student")
+        if submitted:
+            st.session_state["show_settings"] = False
+            st.rerun()
         page_settings()
         return
 
@@ -3657,87 +6160,292 @@ def main():
 
     # ── Top bar ───────────────────────────────────────────────────────────────
     initial = student[0].upper()
-    st.markdown(f"""
-    <div style="background:white;border-bottom:1.5px solid #e5e7eb;
-                padding:10px 20px;margin:0 -1rem 20px -1rem;
-                display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-        <div style="display:flex;align-items:center;gap:8px;background:#f0fdf4;
-                    border:1.5px solid #bbf7d0;border-radius:20px;
-                    padding:5px 12px 5px 8px;cursor:pointer;">
-            <div style="width:24px;height:24px;background:#dcfce7;border-radius:50%;
-                        display:flex;align-items:center;justify-content:center;
-                        color:#16a34a;font-weight:700;font-size:11px;">{initial}</div>
-            <span style="font-weight:600;color:#15803d;font-size:13px;">{student}</span>
-            <span style="color:#86efac;font-size:11px;">▾</span>
-        </div>
-        <span style="color:#6b7280;font-size:13px;">Collector: <b style="color:#111;">{observer}</b></span>
-        <span style="margin-left:auto;font-size:11px;color:#9ca3af;">
-            🔒 Session expires in <b id="session-countdown">{SESSION_TIMEOUT_MIN}:00</b>
-        </span>
-    </div>
-    <script>
-    (function(){{
-        var last={int(_time.time())}, timeout={SESSION_TIMEOUT_MIN * 60};
-        function tick(){{
-            var rem = timeout - (Math.floor(Date.now()/1000) - last);
-            if(rem <= 0){{ document.getElementById('session-countdown').textContent = '0:00'; return; }}
-            var m = Math.floor(rem/60), s = rem%60;
-            var el = document.getElementById('session-countdown');
-            if(el) el.textContent = m+':'+(s<10?'0':'')+s;
-            setTimeout(tick, 1000);
-        }}
-        tick();
-    }})();
-    </script>
-    """, unsafe_allow_html=True)
+    _prof = load_profiles().get(student, {})
+    _prof_chips = ""
+    for _val in [_prof.get("grade"), _prof.get("disability_category") or _prof.get("eligibility"),
+                 _prof.get("teacher") and f"Teacher: {_prof['teacher']}",
+                 _prof.get("school")]:
+        if _val:
+            _prof_chips += (f'<span style="background:#f0fdf4;color:#15803d;border-radius:20px;'
+                            f'padding:2px 9px;font-size:11px;font-weight:600;margin-right:4px;">{_val}</span>')
+    st.markdown(
+        f'<div style="background:white;border-bottom:1.5px solid #e5e7eb;'
+        f'padding:10px 20px;margin:0 -1rem 20px -1rem;'
+        f'display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+        f'<div style="display:flex;align-items:center;gap:8px;background:#f0fdf4;'
+        f'border:1.5px solid #bbf7d0;border-radius:20px;padding:5px 12px 5px 8px;">'
+        f'<div style="width:24px;height:24px;background:#dcfce7;border-radius:50%;'
+        f'display:flex;align-items:center;justify-content:center;'
+        f'color:#16a34a;font-weight:700;font-size:11px;">{initial}</div>'
+        f'<span style="font-weight:700;color:#15803d;font-size:14px;">{student}</span>'
+        f'</div>'
+        f'{_prof_chips}'
+        f'<span style="color:#6b7280;font-size:13px;">Collector: <b style="color:#111;">{observer}</b></span>'
+        f'<span style="margin-left:auto;font-size:11px;color:#9ca3af;">🔒 Session: {SESSION_TIMEOUT_MIN} min</span>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
     # ── Top action buttons ────────────────────────────────────────────────────
-    bc1, bc2, bc3, _ = st.columns([1, 1, 1, 5])
+    bc1, bc2, bc3, bc4, bc5, _ = st.columns([1, 1.4, 1.4, 1.4, 1, 1])
     with bc1:
-        if st.button("Switch", use_container_width=True):
+        if st.button("Return to Student Page", use_container_width=True):
             st.session_state.selected_student = None
             st.rerun()
     with bc2:
-        if st.button("🗑", use_container_width=True,
-                     help="Delete all entries for this student"):
-            st.session_state.confirm_clear = True
+        if st.button("✏️ Edit Student", use_container_width=True,
+                     help="Edit this student's information"):
+            st.session_state.show_edit_student = not st.session_state.get("show_edit_student", False)
+            st.session_state.confirm_clear = False
+            st.session_state.confirm_archive = False
             st.rerun()
     with bc3:
+        if st.button("🗄 Archive", use_container_width=True,
+                     help="Archive this student (preserves all data)"):
+            st.session_state.confirm_archive = not st.session_state.get("confirm_archive", False)
+            st.session_state.show_edit_student = False
+            st.session_state.confirm_clear = False
+            st.rerun()
+    with bc4:
+        if st.button("🗑 Remove All Entries", use_container_width=True,
+                     help="Delete all entries for this student"):
+            st.session_state.confirm_clear = True
+            st.session_state.show_edit_student = False
+            st.session_state.confirm_archive = False
+            st.rerun()
+    with bc5:
         if st.button("⚙", use_container_width=True, help="Category settings"):
             st.session_state["show_settings"] = True
             st.rerun()
 
+    # ── Archive confirmation ──────────────────────────────────────────────────
+    if st.session_state.get("confirm_archive"):
+        st.warning(
+            f"**Archive {student}?**  \n"
+            f"This will remove **{student}** from the active student list. "
+            f"All {len(student_entries)} entries and profile information will be preserved "
+            f"and can be restored any time from the student selector page."
+        )
+        ca1, ca2 = st.columns(2)
+        with ca1:
+            if st.button("Yes, Archive Student", type="primary", use_container_width=True,
+                         key="do_archive_student"):
+                active = load_json(STUDENTS_FILE)
+                active = [s for s in active if s != student]
+                save_json(STUDENTS_FILE, active)
+                archive_list = load_archive()
+                archive_list.append({
+                    "name": student,
+                    "archived_date": datetime.now().strftime("%Y-%m-%d"),
+                    "entry_count": len(student_entries),
+                })
+                save_archive(archive_list)
+                audit_log("ARCHIVE_STUDENT", f"Archived student '{student}' ({len(student_entries)} entries preserved)")
+                st.session_state.confirm_archive = False
+                st.session_state.selected_student = None
+                st.rerun()
+        with ca2:
+            if st.button("Cancel", use_container_width=True, key="cancel_archive_student"):
+                st.session_state.confirm_archive = False
+                st.rerun()
+
+    # ── Profile completeness nudge ────────────────────────────────────────────
+    _nudge_prof = load_profiles().get(student, {})
+    _required_fields = ["grade", "disability_category", "teacher", "school"]
+    _missing = [f for f in _required_fields if not _nudge_prof.get(f)]
+    if _missing and not st.session_state.get("show_edit_student"):
+        st.markdown(
+            '<div style="background:#fffbeb;border:1.5px solid #fde68a;border-radius:10px;'
+            'padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;">'
+            '<span style="font-size:18px;">📝</span>'
+            '<span style="font-size:13px;color:#92400e;">Student profile is incomplete. '
+            'Click <b>✏️ Edit Student</b> to add grade, disability category, teacher, and school.</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+    # ── Edit student information ──────────────────────────────────────────────
+    if st.session_state.get("show_edit_student"):
+        profiles = load_profiles()
+        prof = profiles.get(student, {})
+
+        st.markdown(
+            '<div style="background:#f0f9ff;border:1.5px solid #bae6fd;'
+            'border-radius:12px;padding:20px 22px;margin:10px 0;">',
+            unsafe_allow_html=True
+        )
+        st.markdown("### Edit Student Information")
+
+        # Row 1 — Name + DOB
+        r1a, r1b = st.columns(2)
+        with r1a:
+            new_student_name = st.text_input("Full Name", value=student, key="edit_stu_name")
+        with r1b:
+            new_dob = st.text_input("Date of Birth (MM/DD/YYYY)",
+                                    value=prof.get("dob", ""), key="edit_stu_dob",
+                                    placeholder="MM/DD/YYYY")
+
+        # Row 2 — Grade + Gender
+        r2a, r2b = st.columns(2)
+        with r2a:
+            grade_options = ["", "Pre-K", "Kindergarten", "1st", "2nd", "3rd",
+                             "4th", "5th", "6th", "7th", "8th", "9th", "10th",
+                             "11th", "12th", "Post-Secondary"]
+            cur_grade = prof.get("grade", "")
+            grade_idx = grade_options.index(cur_grade) if cur_grade in grade_options else 0
+            new_grade = st.selectbox("Grade", grade_options, index=grade_idx, key="edit_stu_grade")
+        with r2b:
+            gender_options = ["", "Male", "Female", "Non-binary", "Other", "Prefer not to say"]
+            cur_gender = prof.get("gender", "")
+            gender_idx = gender_options.index(cur_gender) if cur_gender in gender_options else 0
+            new_gender = st.selectbox("Gender", gender_options, index=gender_idx, key="edit_stu_gender")
+
+        # Row 3 — Disability category + Eligibility
+        r3a, r3b = st.columns(2)
+        with r3a:
+            disability_options = [
+                "", "Autism Spectrum Disorder", "Emotional Disturbance",
+                "Intellectual Disability", "Other Health Impairment",
+                "Specific Learning Disability", "Speech/Language Impairment",
+                "Traumatic Brain Injury", "Multiple Disabilities",
+                "Developmental Delay", "Other"
+            ]
+            cur_dis = prof.get("disability_category", "")
+            dis_idx = disability_options.index(cur_dis) if cur_dis in disability_options else 0
+            new_disability = st.selectbox("Disability Category (IDEA)", disability_options,
+                                          index=dis_idx, key="edit_stu_disability")
+        with r3b:
+            new_eligibility = st.text_input("IEP / 504 Eligibility",
+                                            value=prof.get("eligibility", ""),
+                                            key="edit_stu_eligibility",
+                                            placeholder="e.g., IEP – Autism")
+
+        # Row 4 — Teacher + Case manager
+        r4a, r4b = st.columns(2)
+        with r4a:
+            new_teacher = st.text_input("Primary Teacher",
+                                        value=prof.get("teacher", ""),
+                                        key="edit_stu_teacher")
+        with r4b:
+            new_case_mgr = st.text_input("Case Manager / BCBA",
+                                         value=prof.get("case_manager", ""),
+                                         key="edit_stu_case_mgr")
+
+        # Row 5 — School + Classroom
+        r5a, r5b = st.columns(2)
+        with r5a:
+            new_school = st.text_input("School District", value=prof.get("school", ""),
+                                       key="edit_stu_school")
+        with r5b:
+            new_classroom = st.text_input("Classroom / Program",
+                                          value=prof.get("classroom", ""),
+                                          key="edit_stu_classroom")
+
+        # Row 6 — Notes
+        new_notes = st.text_area("Background / Clinical Notes",
+                                 value=prof.get("notes", ""),
+                                 key="edit_stu_notes", height=90,
+                                 placeholder="Relevant history, reinforcers, sensory needs, medical info, etc.")
+
+        # Save / Cancel
+        sv1, sv2 = st.columns([1, 1])
+        with sv1:
+            if st.button("💾 Save Changes", type="primary", use_container_width=True,
+                         key="save_edit_student"):
+                new_name_clean = new_student_name.strip()
+                if not new_name_clean:
+                    st.warning("Student name cannot be blank.")
+                else:
+                    stu_list = load_json(STUDENTS_FILE)
+                    if new_name_clean != student and new_name_clean in stu_list:
+                        st.warning(f"A student named '{new_name_clean}' already exists.")
+                    else:
+                        # Rename in students list and all entries if name changed
+                        if new_name_clean != student:
+                            stu_list = [new_name_clean if s == student else s for s in stu_list]
+                            save_json(STUDENTS_FILE, stu_list)
+                            updated_entries = []
+                            for e in all_entries:
+                                if e.get("student_name") == student:
+                                    e = dict(e)
+                                    e["student_name"] = new_name_clean
+                                updated_entries.append(e)
+                            save_json(DATA_FILE, updated_entries)
+                            # Move profile to new key
+                            if student in profiles:
+                                profiles[new_name_clean] = profiles.pop(student)
+
+                        # Save profile fields
+                        profiles[new_name_clean] = {
+                            "dob": new_dob.strip(),
+                            "grade": new_grade,
+                            "gender": new_gender,
+                            "disability_category": new_disability,
+                            "eligibility": new_eligibility.strip(),
+                            "teacher": new_teacher.strip(),
+                            "case_manager": new_case_mgr.strip(),
+                            "school": new_school.strip(),
+                            "classroom": new_classroom.strip(),
+                            "notes": new_notes.strip(),
+                        }
+                        save_profiles(profiles)
+                        audit_log("EDIT_STUDENT_INFO", f"Updated profile for '{new_name_clean}'"
+                                  + (f" (renamed from '{student}')" if new_name_clean != student else ""))
+                        st.session_state.selected_student = new_name_clean
+                        st.session_state.show_edit_student = False
+                        st.rerun()
+        with sv2:
+            if st.button("Cancel", use_container_width=True, key="cancel_edit_student"):
+                st.session_state.show_edit_student = False
+                st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
     if st.session_state.get("confirm_clear"):
-        st.error(f"Delete ALL {len(student_entries)} entries for {student}?")
+        st.warning(
+            f"**Remove all entries for {student}?**  \n"
+            f"This will permanently delete all {len(student_entries)} record(s) for this student. This cannot be undone."
+        )
         cc1, cc2 = st.columns(2)
         with cc1:
-            if st.button("Yes, delete all", type="primary"):
+            if st.button("Yes, remove all entries", type="primary", use_container_width=True):
                 save_json(DATA_FILE,
                           [e for e in all_entries
                            if e.get("student_name") != student])
+                audit_log("DELETE_ALL_ENTRIES", f"Removed all {len(student_entries)} entries for student: {student}")
                 st.session_state.confirm_clear = False
+                st.success(f"All entries for {student} have been removed.")
                 st.rerun()
         with cc2:
-            if st.button("Cancel"):
+            if st.button("Cancel", use_container_width=True):
                 st.session_state.confirm_clear = False
                 st.rerun()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+        "🗂  Indirect Assessment",
+        "🎯  Reinforcers",
         "📋  New ABC Entry",
         "⏱  New Interval Recording Entry",
         f"⊞  Log ({len(student_entries)})",
-        "📊  Summary",
+        "📊  Basic Summary Data",
+        "🧮  Computational Models",
     ])
     with t1:
-        tab_new_entry(all_entries, student, observer)
+        tab_indirect_assessment(student)
     with t2:
-        tab_interval(all_entries, student, observer)
+        tab_reinforcers(student)
     with t3:
+        tab_new_entry(all_entries, student, observer)
+    with t4:
+        tab_interval(all_entries, student, observer)
+    with t5:
         _abbrevs = load_categories().get("behavior_abbrevs", {})
         tab_log(student_entries, all_entries, student, abbrevs=_abbrevs)
-    with t4:
+    with t6:
         tab_summary(student_entries)
+    with t7:
+        tab_computational_models(student_entries, student)
 
 
 if __name__ == "__main__":

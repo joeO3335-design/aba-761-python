@@ -16,6 +16,20 @@ venv/
 # Claude internal
 .claude/
 
+# API keys / secrets
+.env
+*.env
+!.env.example
+
+# FBA Tracker — secrets, churny runtime data, and backup snapshots (keep out of git)
+fba_tracker📱/data/users.json
+fba_tracker📱/data/audit_log.json
+fba_tracker📱/data/backups/
+
+# Migration staging artifacts (derived from a dry-run; regenerable)
+migration/migrated_fba_data/
+migration/migrated_fba_data_v2/
+
 # Large binary files
 *.pdf
 *.PDF
