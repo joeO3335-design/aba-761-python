@@ -9,6 +9,7 @@ import numpy as np
 import json
 import os
 import shutil
+import uuid
 from datetime import date, datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as _go
@@ -23,7 +24,9 @@ except ImportError:
 DEV_MODE = True
 
 # ── Data files ────────────────────────────────────────────────────────────────
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# FBA_DATA_DIR lets the desktop bundle point FBA at a writable location (the app
+# source is read-only in /Applications). Falls back to the local data/ for dev.
+DATA_DIR = os.environ.get("FBA_DATA_DIR") or os.path.join(os.path.dirname(__file__), "data")
 DATA_FILE      = os.path.join(DATA_DIR, "abc_entries.json")
 STUDENTS_FILE  = os.path.join(DATA_DIR, "students.json")
 PROFILES_FILE  = os.path.join(DATA_DIR, "student_profiles.json")
@@ -191,6 +194,59 @@ def roster_id_for_name(name: str):
         if s.get("name") == name:
             return s.get("id")
     return None
+
+def create_or_get_repertiores_student(name: str):
+    """Ensure a learner exists in the shared Repertiores roster; return its id.
+
+    Write-through so a learner added in FBA also appears in Repertiores with a
+    shared student_id. If the name already exists, return that id (no dup)."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    roster = load_roster()
+    for s in roster:
+        if s.get("name") == name:
+            return s.get("id")
+    sid = uuid.uuid4().hex[:8]
+    roster.append({
+        "id": sid,
+        "name": name,
+        "dob": "",
+        "notes": "",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    _safe_save(REPERTIORES_STUDENTS_FILE, roster)
+    return sid
+
+def rename_repertiores_student(old_name: str, new_name: str) -> None:
+    """Propagate an FBA rename to the shared Repertiores roster (by name match),
+    so the two apps don't diverge and the pull-in sync can't re-add the old name
+    as a duplicate. No-op if the old name isn't in the roster."""
+    if not old_name or not new_name or old_name == new_name:
+        return
+    roster = load_roster()
+    changed = False
+    for s in roster:
+        if s.get("name") == old_name:
+            s["name"] = new_name
+            changed = True
+    if changed:
+        _safe_save(REPERTIORES_STUDENTS_FILE, roster)
+
+def sync_roster_from_repertiores(fba_names: list, archived_names: set) -> list:
+    """Pull Repertiores learners into FBA's active list (one-way, non-destructive).
+
+    Any Repertiores learner FBA doesn't already know — neither active nor
+    archived — is appended to FBA's students.json so it shows in the selector and
+    is managed by FBA's existing (FBA-local) archive/edit logic. Never deletes:
+    removing a learner from Repertiores does NOT remove FBA's records for them."""
+    known = set(fba_names) | set(archived_names)
+    added = [s.get("name") for s in load_roster()
+             if s.get("name") and s.get("name") not in known]
+    if added:
+        fba_names = list(fba_names) + added
+        save_json(STUDENTS_FILE, fba_names)
+    return fba_names
 
 # ── HIPAA: Session timeout (minutes) ─────────────────────────────────────────
 SESSION_TIMEOUT_MIN = 20
@@ -868,6 +924,10 @@ def page_student_selector():
     )
 
     students = load_json(STUDENTS_FILE)
+    # Pull in any learners that live in the shared Repertiores roster but FBA
+    # doesn't know yet, so the two apps stay in sync (non-destructive).
+    _archived_names = {r.get("name") for r in load_archive()}
+    students = sync_roster_from_repertiores(students, _archived_names)
 
     # ── Onboarding empty state ────────────────────────────────────────────────
     if not students:
@@ -1151,6 +1211,9 @@ def page_student_selector():
                 if n and n not in students:
                     students.append(n)
                     save_json(STUDENTS_FILE, students)
+                    # Write through to the shared Repertiores roster so the same
+                    # learner (and student_id) exists in both apps.
+                    create_or_get_repertiores_student(n)
                     st.session_state.show_add_student = False
                     st.session_state.selected_student = n
                     st.session_state["show_settings"] = True
@@ -1247,6 +1310,7 @@ def page_student_selector():
                     if new_name_clean != edit_target:
                         all_stu = [new_name_clean if s == edit_target else s for s in all_stu]
                         save_json(STUDENTS_FILE, all_stu)
+                        rename_repertiores_student(edit_target, new_name_clean)
                         updated = [dict(e, student_name=new_name_clean)
                                    if e.get("student_name") == edit_target else e for e in all_ent]
                         save_json(DATA_FILE, updated)
@@ -6107,6 +6171,17 @@ def main():
                        layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
 
+    # ── Suite: link back to the app chooser (only inside the desktop bundle) ──
+    _switch_url = os.environ.get("SWITCH_URL")
+    if _switch_url:
+        st.markdown(
+            f'<a href="{_switch_url}" target="_self" style="display:inline-block;'
+            f'text-decoration:none;font-size:12px;color:#16a34a;font-weight:700;'
+            f'background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:20px;'
+            f'padding:3px 12px;margin-bottom:6px;">⌂ Suite Home</a>',
+            unsafe_allow_html=True,
+        )
+
     # ── Data safety: surface any corrupt/recovered file from this session ──────
     for _p, _msg in _LOAD_ERRORS.items():
         _name = os.path.basename(_p)
@@ -6364,6 +6439,7 @@ def main():
                         if new_name_clean != student:
                             stu_list = [new_name_clean if s == student else s for s in stu_list]
                             save_json(STUDENTS_FILE, stu_list)
+                            rename_repertiores_student(student, new_name_clean)
                             updated_entries = []
                             for e in all_entries:
                                 if e.get("student_name") == student:

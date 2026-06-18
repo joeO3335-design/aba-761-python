@@ -10876,6 +10876,17 @@ def main():
         st.session_state["current_student"] = st.session_state.pop("_pending_student")
     st.sidebar.title("🎯 Repertiores")
 
+    # Suite: link back to the app chooser (only present inside the desktop bundle).
+    _switch_url = os.environ.get("SWITCH_URL")
+    if _switch_url:
+        st.sidebar.markdown(
+            f'<a href="{_switch_url}" target="_self" style="display:inline-block;'
+            f'text-decoration:none;font-size:12px;color:#2563eb;font-weight:700;'
+            f'background:#eff6ff;border:1.5px solid #bfdbfe;border-radius:20px;'
+            f'padding:3px 12px;margin-bottom:8px;">⌂ Suite Home</a>',
+            unsafe_allow_html=True,
+        )
+
     students = load_students()
     st.sidebar.markdown("**Student**")
     if students:
