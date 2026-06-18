@@ -248,6 +248,57 @@ def sync_roster_from_repertiores(fba_names: list, archived_names: set) -> list:
         save_json(STUDENTS_FILE, fba_names)
     return fba_names
 
+# ── Phase 3: FBA-function → Repertiores behavior-support-plan handoff ─────────
+# When an FBA concludes a behavior's function, the clinician can send a
+# function-based intervention plan to Repertiores. The plan is written to the
+# SHARED data dir, keyed by student_id, so Repertiores surfaces it on the
+# learner's dashboard. The intervention bank is skill-acquisition-focused, so
+# these are curated, function-specific behavior-reduction strategies instead.
+BEHAVIOR_PLANS_FILE = os.path.join(_repertiores_data_dir(), "behavior_support_plans.json")
+
+FUNCTION_INTERVENTIONS = {
+    "Attention": [
+        "Functional Communication Training — teach an appropriate way to recruit attention",
+        "Differential Reinforcement of Alternative behavior (DRA) — attention for appropriate behavior",
+        "Noncontingent Reinforcement (NCR) — attention on a time-based schedule",
+        "Differential Reinforcement of Other behavior (DRO)",
+        "Planned ignoring / attention extinction (withhold attention for the target behavior)",
+    ],
+    "Escape": [
+        "Functional Communication Training — teach a 'break' or 'help' request",
+        "Demand fading / task modification — reduce task difficulty, length, or effort",
+        "High-probability (high-p) instructional sequence",
+        "Errorless teaching / prompting to reduce errors",
+        "Choice-making and interspersing easy (mastered) tasks",
+        "Noncontingent escape / scheduled breaks (NCE)",
+    ],
+    "Tangible": [
+        "Functional Communication Training — teach to request the item/activity appropriately",
+        "Noncontingent access (NCR) to the preferred item on a time-based schedule",
+        "Tolerance / delay training — 'first–then', waiting, schedule thinning",
+        "Differential Reinforcement of Alternative behavior (DRA) for appropriate requests",
+    ],
+    "Sensory": [
+        "Matched / competing stimulation — provide items giving similar sensory input",
+        "Noncontingent (environmental) enrichment",
+        "Response Interruption and Redirection (RIRD)",
+        "Differential Reinforcement of Incompatible behavior (DRI)",
+    ],
+}
+# Visualization uses "Sensory / Automatic"; normalize to the mapping key.
+def interventions_for_function(func: str) -> list:
+    key = "Sensory" if str(func).lower().startswith("sensory") else func
+    return FUNCTION_INTERVENTIONS.get(key, [])
+
+def load_behavior_plans() -> list:
+    return _safe_load(BEHAVIOR_PLANS_FILE, [])
+
+def save_behavior_plan(plan: dict) -> None:
+    """Append a behavior support plan to the shared store Repertiores reads."""
+    plans = load_behavior_plans()
+    plans.append(plan)
+    _safe_save(BEHAVIOR_PLANS_FILE, plans)
+
 # ── HIPAA: Session timeout (minutes) ─────────────────────────────────────────
 SESSION_TIMEOUT_MIN = 20
 
@@ -4185,6 +4236,56 @@ def tab_computational_models(filtered_entries, student=""):
                 )
                 st.plotly_chart(fig_nb, use_container_width=True, config=_PLOTLY_CONFIG)
                 st.dataframe(nb_df, hide_index=True, use_container_width=True)
+
+                # ── Function-based intervention plan → Repertiores handoff ────
+                st.markdown("---")
+                st.markdown("##### 🔗 Function-Based Intervention Plan → Repertiores")
+                _sid = roster_id_for_name(student)
+                if not _sid:
+                    st.caption("This learner isn't linked to a Repertiores record yet, "
+                               "so a plan can't be sent. Add or sync the learner first.")
+                else:
+                    _beh = st.selectbox("Behavior", list(nb_df["Behavior"]),
+                                        key="bsp_behavior")
+                    _row = nb_df[nb_df["Behavior"] == _beh].iloc[0]
+                    _func = _row["Most Likely Function"]
+                    _scores = {f: float(_row[f]) for f in ["Attention", "Escape", "Tangible", "Sensory"]}
+                    st.markdown(
+                        f'<div style="background:#f0fdf4;border:1.5px solid #bbf7d0;border-radius:10px;'
+                        f'padding:10px 14px;margin:6px 0 10px;font-size:13px;">'
+                        f'Identified function for <b>{_beh}</b>: '
+                        f'<b style="color:#15803d;">{_func}</b> '
+                        f'({_scores.get(_func, max(_scores.values())):.0%} posterior)</div>',
+                        unsafe_allow_html=True,
+                    )
+                    _suggested = interventions_for_function(_func)
+                    _picked = st.multiselect(
+                        "Recommended evidence-based interventions (edit before sending)",
+                        _suggested, default=_suggested, key="bsp_interventions")
+                    _note = st.text_input("Optional note for the programming team",
+                                          key="bsp_note", placeholder="Context, precautions, priorities…")
+                    if st.button("📤 Send plan to Repertiores", type="primary", key="bsp_send"):
+                        if not _picked:
+                            st.warning("Select at least one intervention to send.")
+                        else:
+                            save_behavior_plan({
+                                "id": uuid.uuid4().hex[:8],
+                                "student_id": _sid,
+                                "student_name": student,
+                                "behavior": _beh,
+                                "function": _func,
+                                "function_scores": _scores,
+                                "interventions": _picked,
+                                "note": _note.strip(),
+                                "source": "FBA Tracker",
+                                "created_at": datetime.now().isoformat(timespec="seconds"),
+                                "created_by": st.session_state.get("login_email", "unknown"),
+                            })
+                            audit_log("SEND_BEHAVIOR_PLAN",
+                                      f"Sent {_func}-function plan for '{_beh}' "
+                                      f"({student}) to Repertiores")
+                            st.success(f"Plan sent. It now appears on **{student}**'s "
+                                       f"Repertiores dashboard.")
 
     # 2. Hidden Markov Model ───────────────────────────────────────────────────
     with st.expander("Autoregressive Model (ARIMA) — Behavior Frequency Forecast", expanded=False):

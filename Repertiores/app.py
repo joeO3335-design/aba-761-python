@@ -48,6 +48,9 @@ BEHAVIORS_FILE = os.path.join(DATA_DIR, "behaviors.json")
 BEHAVIOR_RECORDS_FILE = os.path.join(DATA_DIR, "behavior_records.json")
 TARGET_BANK_FILE = os.path.join(DATA_DIR, "target_bank.json")
 INTERVENTION_BANK_FILE = os.path.join(DATA_DIR, "intervention_bank.json")
+# Behavior support plans handed off from the FBA Tracker (shared data dir),
+# keyed by student_id. Read-only here — FBA writes them.
+BEHAVIOR_PLANS_FILE = os.path.join(DATA_DIR, "behavior_support_plans.json")
 PHASES_FILE = os.path.join(DATA_DIR, "phases.json")
 BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
 # Per-save automatic snapshots of every data file live in a subfolder so they
@@ -8141,6 +8144,26 @@ def page_student_dashboard():
     sid = current_sid(students)
     st.header(f"{student_name(students, sid)}")
     st.caption("Pick what to work on.")
+
+    # ── Behavior support plans handed off from the FBA Tracker ────────────────
+    _plans = [p for p in _load(BEHAVIOR_PLANS_FILE) if p.get("student_id") == sid]
+    if _plans:
+        with st.expander(f"🧩 Behavior support plans from FBA ({len(_plans)})", expanded=True):
+            for p in sorted(_plans, key=lambda x: x.get("created_at", ""), reverse=True):
+                _fn = p.get("function", "—")
+                _when = (p.get("created_at", "") or "")[:10]
+                st.markdown(
+                    f"**{p.get('behavior', 'Behavior')}** &nbsp;·&nbsp; "
+                    f"function: **{_fn}** &nbsp;·&nbsp; "
+                    f"<span style='color:#6b7280;font-size:12px;'>from {p.get('source','FBA')}"
+                    f"{' · ' + _when if _when else ''}</span>",
+                    unsafe_allow_html=True,
+                )
+                for iv in p.get("interventions", []):
+                    st.markdown(f"- {iv}")
+                if p.get("note"):
+                    st.caption(f"Note: {p['note']}")
+                st.divider()
 
     pdf_session_key = f"dash_pdf_{sid}"
     pdf_bytes = st.session_state.get(pdf_session_key)
